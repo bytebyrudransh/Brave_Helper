@@ -1,14 +1,11 @@
-import type { ChatMessage, OllamaModel } from './store';
-
 const OLLAMA_URL =
   (import.meta.env.VITE_OLLAMA_URL as string | undefined) ??
   'http://localhost:11434';
 
-export async function listOllamaModels(): Promise<OllamaModel[]> {
-  const res = await fetch(`${OLLAMA_URL}/api/tags`);
-  if (!res.ok) throw new Error(`Ollama /api/tags returned ${res.status}`);
-  const data = (await res.json()) as { models?: OllamaModel[] };
-  return data.models ?? [];
+export interface OllamaModel {
+  name: string;
+  size?: number;
+  modified_at?: string;
 }
 
 export interface ChatTurn {
@@ -20,6 +17,13 @@ export interface StreamChatOptions {
   model: string;
   messages: ChatTurn[];
   signal?: AbortSignal;
+}
+
+export async function listOllamaModels(): Promise<OllamaModel[]> {
+  const res = await fetch(`${OLLAMA_URL}/api/tags`);
+  if (!res.ok) throw new Error(`Ollama /api/tags returned ${res.status}`);
+  const data = (await res.json()) as { models?: OllamaModel[] };
+  return data.models ?? [];
 }
 
 export async function* streamChat(
@@ -71,13 +75,4 @@ export async function* streamChat(
   } finally {
     reader.releaseLock();
   }
-}
-
-export function toChatTurns(messages: ChatMessage[], system?: string): ChatTurn[] {
-  const turns: ChatTurn[] = [];
-  if (system) turns.push({ role: 'system', content: system });
-  for (const m of messages) {
-    turns.push({ role: m.role, content: m.content });
-  }
-  return turns;
 }

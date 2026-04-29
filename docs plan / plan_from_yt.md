@@ -1,3 +1,7 @@
+> **Superseded.** This was an inspiration sketch for the in-browser-inference
+> direction. The current product is a local-only Brave side-panel extension —
+> see [`v1.6 brave-extension plan.md`](./v1.6%20brave-extension%20plan.md).
+
 BrowserAI
 AI inference running entirely in the browser — no server, no API keys.
 

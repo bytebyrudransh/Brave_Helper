@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Local Brave Helper",
+  "version": "0.1.0",
+  "description": "Local-only side-panel assistant. Reads the current tab and chats via local Ollama.",
+  "minimum_chrome_version": "114",
+  "action": {
+    "default_title": "Open Local Brave Helper"
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel/index.html"
+  },
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content/index.ts"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": ["sidePanel", "activeTab", "scripting", "storage", "tabs"],
+  "host_permissions": ["http://localhost:11434/*", "http://127.0.0.1:11434/*"]
+}

@@ -1,3 +1,6 @@
+> **Superseded.** This plan is historical. The current source of truth is
+> [`v1.6 brave-extension plan.md`](./v1.6%20brave-extension%20plan.md).
+
 # AI Browser V1 Plan
 
 ## Goal

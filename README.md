@@ -1,10 +1,19 @@
-# Local AI Studio
+# Local Brave Helper
 
-A local-first AI Studio that runs against [Ollama](https://ollama.com/) on your own machine. No backend, no API keys, no cloud calls.
+A local-only Brave (Chromium) **side-panel assistant** that reads the current tab and chats via your local [Ollama](https://ollama.com/). Loaded as an unpacked extension on your own machine. Not published.
 
-**Phase 2** of the [V1.5-lean plan](./docs%20plan%20/v1.5-lean%20plan.md) is in: RAG over local documents (PDF / TXT / MD), client-side embeddings via Transformers.js (BGE-small) running in a Web Worker, IndexedDB persistence, and grounded chat with clickable citations.
+See [`docs plan /v1.6 brave-extension plan.md`](./docs%20plan%20/v1.6%20brave-extension%20plan.md) for scope and rationale.
 
-Stack: React 18 + TypeScript + Vite + Tailwind v4 + Zustand. Streaming chat against Ollama. Embeddings via `@huggingface/transformers`. PDF parsing via `pdfjs-dist`. Storage via `idb`.
+Stack: Manifest V3 + React 18 + TypeScript + Vite + Tailwind v4 + Zustand, built with [`@crxjs/vite-plugin`](https://crxjs.dev/vite-plugin).
+
+## What it does (V1)
+
+- Side panel UI in Brave / Chromium.
+- Reads the active tab: title, URL, visible text, flat list of links.
+- Streams responses from a local Ollama model.
+- Summarize, Q&A, extract links / prices / dates / emails grounded in the page.
+
+Action features (`fillField`, `click`) are deliberately **not** in V1 — they will require explicit confirmation when added.
 
 ## Prerequisites
 
@@ -12,56 +21,64 @@ Stack: React 18 + TypeScript + Vite + Tailwind v4 + Zustand. Streaming chat agai
 2. **Ollama** installed and running locally.
 
    ```sh
-   # macOS / Linux
    curl -fsSL https://ollama.com/install.sh | sh
-
-   # Pull a model (default expected: llama3.1)
    ollama pull llama3.1:8b
    ```
 
-3. **Allow the browser to call Ollama.** By default the Ollama daemon refuses cross-origin requests from a browser. Restart it with the dev origin allowed:
+3. **Let the extension call Ollama.** Ollama refuses cross-origin requests by default. Start it with extension origins allowed:
 
    ```sh
-   OLLAMA_ORIGINS="http://localhost:5173" ollama serve
+   OLLAMA_ORIGINS="chrome-extension://*" ollama serve
    ```
 
-   Or allow all origins for local development:
+   Or, to also keep dev-server access during build work:
 
    ```sh
-   OLLAMA_ORIGINS="*" ollama serve
+   OLLAMA_ORIGINS="chrome-extension://*,http://localhost:5173" ollama serve
    ```
 
-## Run
+## Build and load
 
 ```sh
 npm install
-npm run dev
+npm run build
 ```
 
-Open the URL printed by Vite (usually `http://localhost:5173`).
+In Brave:
+
+1. Open `brave://extensions`.
+2. Enable **Developer mode** (top-right).
+3. Click **Load unpacked** and select the `dist/` folder produced by the build.
+4. Pin the extension. Click its icon — the side panel opens beside the active tab.
+
+To reload after changes, run `npm run build` again and click the reload icon on the extension card.
 
 ## Scripts
 
-- `npm run dev` — start the Vite dev server.
-- `npm run build` — type-check (`tsc -b`) and build for production.
-- `npm run typecheck` — type-check only, no emit.
-- `npm run preview` — serve the production build locally.
+- `npm run build` — type-check + production build into `dist/`.
+- `npm run dev` — Vite dev server with HMR for the side panel (the extension itself still needs `npm run build` to refresh once installed).
+- `npm run typecheck` — type-check only.
 
 ## Configuration
 
-Environment variables (set in a `.env.local` file at the repo root):
+`.env.local` at the repo root:
 
-- `VITE_OLLAMA_URL` — override the Ollama base URL. Defaults to `http://localhost:11434`.
+- `VITE_OLLAMA_URL` — override the Ollama base URL. Default `http://localhost:11434`.
 
-## Using RAG (Phase 2)
+## Layout
 
-1. Open the **Documents** tab.
-2. Upload a PDF, TXT, or MD file. The first upload triggers a one-time download of the BGE-small embeddings model (~100 MB, cached in your browser afterward).
-3. Click **Add to scope** on one or more documents.
-4. Switch to **Chat** and ask a question. Answers are grounded in retrieved chunks and show clickable citation pills you can expand to see the source text.
+```
+manifest.json                MV3 manifest
+src/
+  background/index.ts        service worker — opens side panel on action click
+  content/index.ts           DOM reader (title, URL, innerText, links)
+  sidepanel/                 side panel React app
+  lib/
+    ollama.ts                streaming /api/chat client
+    page.ts                  side panel ↔ content script messaging
+  store/index.ts             Zustand store (messages, model, page snapshot)
+```
 
-Documents, embeddings, conversations, and messages are all persisted in IndexedDB. Closing and reopening the app preserves everything.
+## Status
 
-## What's Next
-
-See [`docs plan/v1.5-lean plan.md`](./docs%20plan%20/v1.5-lean%20plan.md). Phase 3 = Studio polish (model manager, conversation list, command palette). Phase 4 = WebLLM as a no-Ollama fallback. Phase 5 (V2) = Manifest V3 browser extension.
+V1 scope per [`docs plan /v1.6 brave-extension plan.md`](./docs%20plan%20/v1.6%20brave-extension%20plan.md). Earlier "Local AI Studio" (RAG over local docs, in-browser embeddings) work lives in git history at commit `4064471`.
