@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import type { OllamaModel } from '../lib/ollama';
+import { PROJECT_MODELS } from '../config/models';
+import type { VaultData } from '../lib/vault';
 
 export type ChatRole = 'user' | 'assistant';
 
@@ -18,6 +20,8 @@ export interface PageSnapshot {
   capturedAt: number;
 }
 
+export type ViewTab = 'chat' | 'history' | 'form-fill' | 'vault' | 'settings';
+
 interface AppState {
   models: OllamaModel[];
   selectedModel: string | null;
@@ -28,6 +32,11 @@ interface AppState {
 
   messages: ChatMessage[];
   isStreaming: boolean;
+  currentSessionId: string | null;
+  activeTab: ViewTab;
+  
+  vaultData: VaultData | null;
+  vaultPassword: string | null;
 
   setModels: (models: OllamaModel[]) => void;
   setSelectedModel: (name: string) => void;
@@ -41,6 +50,10 @@ interface AppState {
   finishStreaming: (id: string) => void;
   setIsStreaming: (v: boolean) => void;
   clearMessages: () => void;
+  setMessages: (messages: ChatMessage[]) => void;
+  setCurrentSessionId: (id: string | null) => void;
+  setActiveTab: (tab: ViewTab) => void;
+  setVaultData: (data: VaultData | null, password: string | null) => void;
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -53,15 +66,26 @@ export const useAppStore = create<AppState>((set) => ({
 
   messages: [],
   isStreaming: false,
+  currentSessionId: null,
+  activeTab: 'chat',
+  
+  vaultData: null,
+  vaultPassword: null,
 
   setModels: (models) =>
     set((state) => {
+      const allowedNames = new Set(PROJECT_MODELS.map((model) => model.name));
+      const filtered = models.filter((model) => allowedNames.has(model.name));
       const preferred =
-        state.selectedModel ??
-        models.find((m) => /llama3|qwen2\.5/.test(m.name))?.name ??
-        models[0]?.name ??
+        (state.selectedModel && filtered.some((m) => m.name === state.selectedModel)
+          ? state.selectedModel
+          : null) ??
+        PROJECT_MODELS.find((model) =>
+          filtered.some((installed) => installed.name === model.name)
+        )?.name ??
+        filtered[0]?.name ??
         null;
-      return { models, selectedModel: preferred };
+      return { models: filtered, selectedModel: preferred };
     }),
   setSelectedModel: (name) => set({ selectedModel: name }),
   setOllamaReachable: (ok) => set({ ollamaReachable: ok }),
@@ -83,5 +107,9 @@ export const useAppStore = create<AppState>((set) => ({
       ),
     })),
   setIsStreaming: (v) => set({ isStreaming: v }),
-  clearMessages: () => set({ messages: [] }),
+  clearMessages: () => set({ messages: [], currentSessionId: null }),
+  setMessages: (messages) => set({ messages }),
+  setCurrentSessionId: (id) => set({ currentSessionId: id }),
+  setActiveTab: (tab) => set({ activeTab: tab }),
+  setVaultData: (data, password) => set({ vaultData: data, vaultPassword: password }),
 }));

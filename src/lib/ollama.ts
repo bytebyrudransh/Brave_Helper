@@ -16,6 +16,7 @@ export interface ChatTurn {
 export interface StreamChatOptions {
   model: string;
   messages: ChatTurn[];
+  numCtx?: number;
   signal?: AbortSignal;
 }
 
@@ -36,6 +37,7 @@ export async function* streamChat(
       model: opts.model,
       messages: opts.messages,
       stream: true,
+      options: opts.numCtx ? { num_ctx: opts.numCtx } : undefined,
     }),
     signal: opts.signal,
   });
