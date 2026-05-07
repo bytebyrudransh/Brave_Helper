@@ -22,6 +22,7 @@ const DEFAULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 export type AuditEventType =
   | 'mode_transition'
+  | 'mode_switched'
   | 'vault_unlock'
   | 'vault_lock'
   | 'outbound_request'
@@ -29,7 +30,8 @@ export type AuditEventType =
   | 'screenshot_captured'
   | 'autofill_executed'
   | 'memory_recall'
-  | 'model_switched';
+  | 'model_switched'
+  | 'auto_routed';
 
 export interface AuditEvent {
   id: string;

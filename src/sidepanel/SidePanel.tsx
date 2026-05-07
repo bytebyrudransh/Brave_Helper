@@ -27,7 +27,9 @@ import { capabilitiesFor } from '../lib/mode';
 import { indexMemory, recallMemory } from '../lib/vectorstore';
 import { logAudit, pruneAudit } from '../lib/audit';
 import { requestActiveTabSnapshot, requestFormExtraction, requestFormFill } from '../lib/page';
-import { PROJECT_MODEL_MAP, PROJECT_MODELS } from '../config/models';
+import { PROJECT_MODEL_MAP, PROJECT_MODELS, AUTO_MODE_LABEL } from '../config/models';
+import type { ModelTier } from '../config/models';
+import { classifyIntent } from '../lib/router';
 import { captureVisibleScreenshot, saveCurrentPage } from '../lib/session';
 import { 
   saveChatSession, 
@@ -140,6 +142,8 @@ export default function SidePanel() {
   const appMode = deriveMode(vaultData !== null);
 
   const [input, setInput] = useState('');
+  const [autoMode, setAutoMode] = useState(true);
+  const [routedTier, setRoutedTier] = useState<ModelTier | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
   const [pageLoading, setPageLoading] = useState(false);
   const [activeTabUrl, setActiveTabUrl] = useState<string | null>(null);
@@ -339,6 +343,37 @@ export default function SidePanel() {
       return;
     }
 
+    // --- V4.0 Intelligent Routing ---
+    // If auto mode is on, classify the user's intent and switch to the
+    // right specialist before sending. The router uses the fastest model
+    // with a tiny classification prompt (~50 tokens, ~0.3s).
+    let activeModel = selectedModel;
+    let activeModelConfig = selectedModelConfig;
+
+    if (autoMode) {
+      const installedNames = useAppStore.getState().models.map(m => m.name);
+      const classifiedTier = await classifyIntent(content, false, installedNames);
+      setRoutedTier(classifiedTier);
+
+      const targetConfig = PROJECT_MODELS.find(m => m.tier === classifiedTier);
+      if (targetConfig && installedNames.includes(targetConfig.name)) {
+        // Unload previous model to free VRAM (fire-and-forget).
+        if (activeModel && activeModel !== targetConfig.name) {
+          void unloadOllamaModel(activeModel).catch(() => {});
+        }
+        activeModel = targetConfig.name;
+        activeModelConfig = targetConfig;
+        setSelectedModel(activeModel);
+
+        void logAudit({
+          type: 'auto_routed',
+          mode: vaultData ? 'autofill' : 'research',
+          summary: `Router → ${targetConfig.label}`,
+          details: { tier: classifiedTier, model: targetConfig.name, query: content.slice(0, 100) },
+        });
+      }
+    }
+
     const userMsg = { id: crypto.randomUUID(), role: 'user' as const, content };
     appendMessage(userMsg);
 
@@ -352,9 +387,9 @@ export default function SidePanel() {
     setIsStreaming(true);
     try {
       for await (const chunk of streamChat({
-        model: selectedModel,
+        model: activeModel,
         messages: turns,
-        numCtx: selectedModelConfig?.numCtx,
+        numCtx: activeModelConfig?.numCtx,
         signal: ctrl.signal,
       })) {
         appendToMessage(assistantId, chunk);
@@ -412,6 +447,9 @@ export default function SidePanel() {
   async function handleImageUpload(file: File) {
     if (!selectedModel || !ollamaReachable) return;
 
+    // V4.0: auto-route to vision when image is attached
+    if (autoMode) setRoutedTier('vision');
+
     const reader = new FileReader();
     reader.onload = async () => {
       const base64 = reader.result as string;
@@ -464,6 +502,25 @@ export default function SidePanel() {
   async function askWithPreset(content: string) {
     setInput(content);
     await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // V4.0 routing for presets too
+    let activeModel = selectedModel!;
+    let activeModelConfig = selectedModelConfig;
+    if (autoMode) {
+      const installedNames = useAppStore.getState().models.map(m => m.name);
+      const classifiedTier = await classifyIntent(content, false, installedNames);
+      setRoutedTier(classifiedTier);
+      const targetConfig = PROJECT_MODELS.find(m => m.tier === classifiedTier);
+      if (targetConfig && installedNames.includes(targetConfig.name)) {
+        if (activeModel && activeModel !== targetConfig.name) {
+          void unloadOllamaModel(activeModel).catch(() => {});
+        }
+        activeModel = targetConfig.name;
+        activeModelConfig = targetConfig;
+        setSelectedModel(activeModel);
+      }
+    }
+
     const userMsg = { id: crypto.randomUUID(), role: 'user' as const, content };
     appendMessage(userMsg);
 
@@ -478,9 +535,9 @@ export default function SidePanel() {
     setInput('');
     try {
       for await (const chunk of streamChat({
-        model: selectedModel!,
+        model: activeModel,
         messages: turns,
-        numCtx: selectedModelConfig?.numCtx,
+        numCtx: activeModelConfig?.numCtx,
         signal: ctrl.signal,
       })) {
         appendToMessage(assistantId, chunk);
@@ -604,6 +661,18 @@ export default function SidePanel() {
       return;
     }
 
+    if (head === '/auto') {
+      setAutoMode(true);
+      setRoutedTier(null);
+      void logAudit({
+        type: 'mode_switched',
+        mode: vaultData ? 'autofill' : 'research',
+        summary: 'Switched to AUTO mode — AI Router active',
+      });
+      appendAssistantNote('Switched to **AUTO** mode. The AI router will now pick the best model for each message.');
+      return;
+    }
+
     if (head === '/fast' || head === '/balanced' || head === '/smart' || head === '/code') {
       const tier = head.slice(1) as 'fast' | 'balanced' | 'smart' | 'code';
       const target = PROJECT_MODELS.find((m) => m.tier === tier);
@@ -619,21 +688,23 @@ export default function SidePanel() {
       const prev = selectedModel;
       setSelectedModel(target.name);
       void saveSelectedModel(target.name);
+      setAutoMode(false); // Manual override disables auto mode
+      setRoutedTier(null);
       if (prev && prev !== target.name) {
         void unloadOllamaModel(prev).catch(() => {});
       }
       void logAudit({
         type: 'model_switched',
         mode: vaultData ? 'autofill' : 'research',
-        summary: `Switched to ${target.label}`,
+        summary: `Switched to ${target.label} (manual)`,
         details: { from: prev ?? 'none', to: target.name, tier },
       });
-      appendAssistantNote(`Switched to ${target.label}.`);
+      appendAssistantNote(`Switched to ${target.label}. Auto mode disabled.`);
       return;
     }
 
     appendAssistantNote(
-      'Unknown command. Try /start, /clear, /summary, /save, /takeSS, /ask <prompt>, /search <query>, /recall <query>, or /fast | /balanced | /smart | /code.'
+      'Unknown command. Try /auto, /start, /clear, /summary, /save, /takeSS, /ask <prompt>, /search <query>, /recall <query>, or /fast | /balanced | /smart | /code.'
     );
   }
 
@@ -917,20 +988,27 @@ export default function SidePanel() {
           <div className="flex items-center gap-1">
             <div className="relative group">
               <select
-                value={selectedModel ?? ''}
+                value={autoMode ? '__auto__' : (selectedModel ?? '')}
                 onChange={(e) => {
-                  const next = e.target.value;
+                  const val = e.target.value;
+                  if (val === '__auto__') {
+                    setAutoMode(true);
+                    setRoutedTier(null);
+                    return;
+                  }
+                  // Manual selection — disable auto mode.
+                  setAutoMode(false);
+                  setRoutedTier(null);
                   const prev = selectedModel;
-                  setSelectedModel(next);
-                  void saveSelectedModel(next);
-                  // Free VRAM/RAM held by the previously selected model.
-                  // Fire-and-forget; failures are non-fatal.
-                  if (prev && prev !== next) {
+                  setSelectedModel(val);
+                  void saveSelectedModel(val);
+                  if (prev && prev !== val) {
                     void unloadOllamaModel(prev).catch(() => {});
                   }
                 }}
                 className="h-8 appearance-none rounded-lg border border-border bg-surface pl-8 pr-8 text-[11px] font-semibold text-text-secondary outline-none transition-all hover:border-accent hover:text-white"
               >
+                <option value="__auto__">{AUTO_MODE_LABEL}</option>
                 {models.length === 0 && <option value="">No Models</option>}
                 {models.map((m) => (
                   <option key={m.name} value={m.name}>
@@ -1107,7 +1185,7 @@ export default function SidePanel() {
               ))}
             </div>
             <div className="flex flex-wrap justify-center gap-2 max-w-xs">
-              {['/start', '/clear', '/summary', '/takeSS', '/save', '/ask', '/search '].map((item) => (
+              {['/auto', '/start', '/clear', '/summary', '/takeSS', '/save', '/ask', '/search '].map((item) => (
                 <button
                   key={item}
                   onClick={() => setInput(item)}
@@ -1130,7 +1208,9 @@ export default function SidePanel() {
                    <span className="text-[10px] font-bold uppercase tracking-widest text-text-muted">
                      {m.role === 'user'
                        ? 'System User'
-                       : (selectedModelConfig?.label.toUpperCase() ?? selectedModel?.toUpperCase() ?? 'Assistant')}
+                       : autoMode && routedTier
+                         ? `AUTO → ${routedTier.toUpperCase()}`
+                         : (selectedModelConfig?.label.toUpperCase() ?? selectedModel?.toUpperCase() ?? 'Assistant')}
                    </span>
                 </div>
                 <div

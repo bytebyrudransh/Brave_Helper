@@ -4,7 +4,13 @@ import gptOss_20bPrompt from '../../project-models/gpt-oss-20b.md?raw';
 import qwenCoder_14bPrompt from '../../project-models/qwen2.5-coder-14b.md?raw';
 import llava_7bPrompt from '../../project-models/llava-7b.md?raw';
 
+/**
+ * ModelTier — the specialist tiers.
+ * 'auto' is the V4.0 manager mode: the router classifies intent and picks
+ * the right specialist per-message. It is NOT a real model — it's a meta-tier.
+ */
 export type ModelTier = 'fast' | 'balanced' | 'smart' | 'code' | 'vision';
+export type SelectableTier = ModelTier | 'auto';
 
 export interface ProjectModelConfig {
   name: string;
@@ -16,7 +22,7 @@ export interface ProjectModelConfig {
 }
 
 /**
- * V3.0 model tiers. Defaults are tuned for a 16GB VRAM card — every entry
+ * V4.0 model tiers. Defaults are tuned for a 16GB VRAM card — every entry
  * fits fully in VRAM with headroom for KV cache, no spillover to system RAM.
  *
  * Order matters: first installed match in this list becomes the default.
@@ -68,7 +74,11 @@ export const PROJECT_MODEL_MAP = new Map(
   PROJECT_MODELS.map((model) => [model.name, model])
 );
 
-export const DEFAULT_TIER: ModelTier = 'fast';
+/** V4.0 default: auto mode — the router picks the right model per-message. */
+export const DEFAULT_TIER: SelectableTier = 'auto';
+
+/** Label shown in the UI when auto mode is active. */
+export const AUTO_MODE_LABEL = '⚡ AUTO — AI Router';
 
 export function getModelByTier(tier: ModelTier): ProjectModelConfig | undefined {
   return PROJECT_MODELS.find((m) => m.tier === tier);

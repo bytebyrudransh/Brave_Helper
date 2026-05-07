@@ -13,6 +13,8 @@ import {
   Lock,
   Unlock,
   Filter,
+  Zap,
+  ToggleRight,
 } from 'lucide-react';
 import {
   listAudit,
@@ -34,6 +36,8 @@ const TYPE_META: Record<
   autofill_executed: { label: 'Autofill', tone: 'red', Icon: ShieldCheck },
   memory_recall: { label: 'Recall', tone: 'blue', Icon: Search },
   model_switched: { label: 'Model swap', tone: 'gray', Icon: Cpu },
+  auto_routed: { label: 'Auto routed', tone: 'blue', Icon: Zap },
+  mode_switched: { label: 'Mode switch', tone: 'amber', Icon: ToggleRight },
 };
 
 const TONE_CLASS: Record<string, string> = {
