@@ -47,6 +47,45 @@ export async function unloadOllamaModel(name: string): Promise<void> {
   });
 }
 
+/**
+ * Preload a model into VRAM without generating any tokens.
+ *
+ * Sends an empty-prompt generate request with keep_alive set to 5 minutes.
+ * Ollama loads the model weights into GPU memory and keeps them warm.
+ * The next real inference request will skip the cold-start entirely.
+ *
+ * Fire-and-forget — callers should not block on this.
+ */
+export async function preloadModel(name: string): Promise<void> {
+  await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: name,
+      prompt: '',
+      keep_alive: '5m',
+    }),
+  });
+}
+
+/**
+ * Cold-start hygiene: ask Ollama to drop the given models from VRAM if they
+ * happen to be loaded. Used on extension init so the user's GPU stays idle
+ * until they actually send a message.
+ *
+ * Fire-and-forget. Safe to call on models that aren't loaded — Ollama just
+ * returns immediately.
+ */
+export async function unloadAllModels(names: string[]): Promise<void> {
+  await Promise.all(
+    names.map((name) =>
+      unloadOllamaModel(name).catch(() => {
+        // ignore individual failures — best-effort cleanup
+      })
+    )
+  );
+}
+
 export async function* streamChat(
   opts: StreamChatOptions
 ): AsyncGenerator<string, void, void> {

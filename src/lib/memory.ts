@@ -65,15 +65,8 @@ export async function deleteFact(id: string): Promise<void> {
  */
 export function formatMemoryPrompt(facts: MemoryFact[]): string {
   if (facts.length === 0) return '';
-  
-  const lines = facts.map(f => `- ${f.key}: ${f.value}`);
-  return [
-    '## What I know about you (from previous conversations)',
-    'Use this information to personalize your responses when relevant:',
-    ...lines,
-    '',
-    'If the user corrects any of these facts, note the correction in your response.',
-  ].join('\n');
+  const lines = facts.map((f) => `- ${f.key}: ${f.value}`);
+  return ['## About the user', ...lines].join('\n');
 }
 
 /**

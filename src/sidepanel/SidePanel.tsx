@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { deriveMode, MODE_DESCRIPTIONS, MODE_LABELS } from '../lib/mode';
-import { listOllamaModels, streamChat, unloadOllamaModel, type ChatTurn } from '../lib/ollama';
+import { listOllamaModels, streamChat, unloadOllamaModel, unloadAllModels, type ChatTurn } from '../lib/ollama';
 import { streamVision } from '../lib/vision';
 import { searchWeb, formatSearchContext } from '../lib/search';
 import { capabilitiesFor } from '../lib/mode';
@@ -67,21 +67,31 @@ function buildPageContext(): string | null {
     .map((l) => `- ${l.text || '(no text)'} → ${l.href}`)
     .join('\n');
   const linksTruncated = page.links.length > PAGE_LINKS_CAP;
+  const trimmedText = pageText.trim();
 
-  let ctx = `# Current page
+  // PRIMARY CONTENT — keep this prominent and lead with it. Smaller models
+  // (Fast tier) tend to anchor on whatever shows up first; if form fields
+  // came before the page text, the model assumed it was looking at metadata
+  // and refused to discuss the actual page.
+  let ctx = `# THE PAGE THE USER IS LOOKING AT
+This is the actual content of the user's current tab. Treat it as the primary source for any question about the page.
+
 Title: ${page.title}
 URL: ${page.url}
 
-## Visible text${truncated ? ' (truncated)' : ''}
-${pageText}${truncated ? '\n\n[truncated — page was longer than the chat context budget]' : ''}
+## Visible page content${truncated ? ' (truncated)' : ''}
+${trimmedText.length > 0
+  ? trimmedText + (truncated ? '\n\n[truncated — page was longer than the chat context budget]' : '')
+  : '[the page captured no readable text — it may be a video, an image-only page, or content rendered dynamically after sync. Tell the user this if they ask about content.]'}
 
-## Links${linksTruncated ? ` (top ${PAGE_LINKS_CAP} of ${page.links.length})` : ''}
-${linkList}`;
+## Links on the page${linksTruncated ? ` (top ${PAGE_LINKS_CAP} of ${page.links.length})` : ''}
+${linkList || '[no links extracted]'}`;
 
-  // Inject form fields so AI can see what's on the page (visible AND hidden)
+  // SECONDARY METADATA — form fields exist for autofill only. Mark them
+  // explicitly so the model doesn't confuse selectors with page content.
   if (extractedForms.length > 0) {
-    ctx += '\n\n## Form Fields on This Page\n';
-    ctx += 'Below are ALL form fields detected on this page (including hidden). Use their EXACT selectors when autofilling.\n\n';
+    ctx += '\n\n## Form fields (autofill metadata — NOT page content)\n';
+    ctx += 'These selectors exist only for the autofill feature. Do NOT use them to describe the page or answer content questions. Refer to them only when the user explicitly asks to fill, log in, or submit a form.\n\n';
     for (const form of extractedForms) {
       ctx += `### ${form.id === 'orphan-inputs' ? 'Standalone Inputs' : `Form: ${form.id}`}\n`;
       for (const field of form.fields) {
@@ -93,15 +103,15 @@ ${linkList}`;
   // Inject vault data so AI can match credentials to fields
   if (vaultData) {
     ctx += '\n\n## User Vault Data (UNLOCKED — Full Access Granted)\n';
-    ctx += 'The user has unlocked their vault. You have FULL permission to use this data. No confirmation needed.\n\n';
-    
+    ctx += 'The user has unlocked their vault. You have FULL permission to use this data when filling forms. No confirmation needed.\n\n';
+
     if (vaultData.logins.length > 0) {
       ctx += '### Saved Logins\n';
       for (const login of vaultData.logins) {
         ctx += `- URL: ${login.url} | Username: ${login.username} | Password: ${login.password || '(none)'}${login.notes ? ` | Notes: ${login.notes}` : ''}\n`;
       }
     }
-    
+
     if (vaultData.profiles.length > 0) {
       ctx += '\n### Saved Profiles\n';
       for (const profile of vaultData.profiles) {
@@ -161,6 +171,12 @@ export default function SidePanel() {
   useEffect(() => {
     async function init() {
       void pruneAudit();
+      // Cold-start hygiene: unload any tier models still warm in VRAM from a
+      // prior session. The user explicitly wanted no model loaded until they
+      // actually send a message — keeps the GPU idle on extension open.
+      // Awaited (not fire-and-forget) so the eviction completes before any
+      // later init step could re-warm Ollama.
+      await unloadAllModels(PROJECT_MODELS.map((m) => m.name));
       const savedModel = await getSelectedModel();
       await refreshModels(savedModel);
       await capturePage();
@@ -596,6 +612,19 @@ export default function SidePanel() {
       return;
     }
 
+    if (head === '/describe') {
+      // Long-form override. Default chat is concise; this turn only, ask the
+      // model for depth and structure. The user's question follows the slash.
+      if (!arg) {
+        appendAssistantNote('Usage: /describe <question> — gives a thorough, structured answer for this turn.');
+        return;
+      }
+      await askWithPreset(
+        `Give a thorough, well-structured, detailed answer to the following. Use headings or bullets where they help. Don't pad — be substantive.\n\n${arg}`
+      );
+      return;
+    }
+
     if (head === '/save') {
       const currentPage = useAppStore.getState().page;
       if (!currentPage) {
@@ -704,7 +733,7 @@ export default function SidePanel() {
     }
 
     appendAssistantNote(
-      'Unknown command. Try /auto, /start, /clear, /summary, /save, /takeSS, /ask <prompt>, /search <query>, /recall <query>, or /fast | /balanced | /smart | /code.'
+      'Unknown command. Try /auto, /start, /clear, /summary, /describe <q>, /save, /takeSS, /ask <prompt>, /search <query>, /recall <query>, or /fast | /balanced | /smart | /code.'
     );
   }
 
@@ -1185,7 +1214,7 @@ export default function SidePanel() {
               ))}
             </div>
             <div className="flex flex-wrap justify-center gap-2 max-w-xs">
-              {['/auto', '/start', '/clear', '/summary', '/takeSS', '/save', '/ask', '/search '].map((item) => (
+              {['/auto', '/start', '/clear', '/summary', '/describe ', '/takeSS', '/save', '/ask', '/search ', '/recall '].map((item) => (
                 <button
                   key={item}
                   onClick={() => setInput(item)}

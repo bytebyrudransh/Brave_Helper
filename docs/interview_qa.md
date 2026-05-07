@@ -1,6 +1,73 @@
-# Neural Architecture Local Helper: Interview Q&A
+# Brave Helper (V4.0): Interview Q&A
 
-This document contains over 100 potential technical interview questions and answers tailored to the architecture, design decisions, and technologies used in the **Neural Architecture Local Helper** extension. 
+This document contains 130+ potential technical interview questions and answers tailored to the architecture, design decisions, and technologies used in the **Brave Helper** extension (a local-first AI side-panel for Brave / Chromium).
+
+The original 100 questions cover the V2.0 foundation (vault, autofill, content-script messaging). Parts 6 and 7 cover V3.0 (modes, vision, RAG, audit) and V4.0 (auto-router).
+
+---
+
+## Project Theory — what this project actually is
+
+Before the questions, here's the big picture so the rest makes sense.
+
+### The product
+Brave Helper is a side-panel that sits next to a browser tab and helps the user **read, research, recall, and autofill** — entirely with models running on the user's own machine via Ollama. There is no cloud, no API key, no account, no telemetry.
+
+### The four jobs
+1. **Read the page the user is looking at** and answer questions about it.
+2. **Search the web** when local context isn't enough.
+3. **Recall** what the user has saved in the past via local RAG.
+4. **Autofill forms** from an encrypted vault when the user opts in.
+
+### The architectural commitment: one-way internet
+The single most important property of the codebase: **the model READS, never WRITES.** All outbound public-internet HTTP goes through `lib/http.ts::safeFetch`, which is GET-only and refuses non-http(s) protocols. Localhost POSTs (Ollama on 11434) are exempt — those never leave the machine. The model has no `sendEmail()`, `uploadFile()`, or `postToAPI()` tool — those simply do not exist in the toolset.
+
+This makes "privacy" a property of the architecture, not a marketing claim. Even if the model misbehaves, there's no outbound channel for user data.
+
+### The two modes (V3.0)
+The vault contains credentials. The web is a place data could leak to. So at any moment, exactly one of these is allowed:
+
+- 🟢 **Research mode** (default) — page reading + web search + URL fetch + screenshots + memory recall, all on. **Vault locked.**
+- 🔴 **Autofill mode** — vault unlocked. **Web access automatically cut.** Model can fill the form in front of the user, but can't reach the network.
+
+Mutual exclusion is enforced in code via `lib/mode.ts::capabilitiesFor(mode)`. Mode is *derived* from vault state (not stored separately) so drift is impossible.
+
+### The five tier system (V3.0)
+Different models for different jobs, all sized for a 16 GB VRAM card with no spillover to system RAM:
+
+- **Fast** — `qwen3.5:9b` (6.6 GB) — default chat, summaries, autofill
+- **Balanced** — `qwen3:14b` (9.3 GB) — page Q&A, form analysis
+- **Smart** — `gpt-oss:20b` (13 GB) — deep reasoning
+- **Code** — `qwen2.5-coder:14b` (9 GB) — auto-engaged on dev pages
+- **Vision** — `llava:7b` (4.7 GB) — `/ask` screenshot Q&A
+- **Embeddings** — `nomic-embed-text` (274 MB) — RAG indexing for `/recall`
+
+Each tier has a hand-tuned system prompt in `project-models/`. Default is concise; the user opts into long answers with `/describe`.
+
+### The auto-router (V4.0)
+Instead of making the user pick a tier, a **manager model** classifies every message and routes it to the right specialist. The router is the smallest model (`qwen3.5:9b`) running with `temperature=0.0`, `num_ctx=2048`, `num_predict=32`, and a JSON-only system prompt. It reads the user's message and returns `{"tier":"code"}` (or fast/balanced/smart/vision). The system then loads the chosen specialist and runs the real inference.
+
+Cost: ~50–150 classification tokens per message (~0.3 s on the 9B). Benefit: the user doesn't think about which model to use.
+
+### The privacy audit panel (V3.0)
+Every privacy-relevant action — mode change, web request, page read, vault unlock, autofill execution, model swap, route decision — is logged locally in `chrome.storage.local`. The **AUDIT** tab shows the log with type filter, time-window filter, JSON export, and clear-all. This is the killer transparency feature: the user can see exactly what the helper has done.
+
+### The stack
+- React 18 + TypeScript on the frontend
+- Vite + CRXJS for build / Manifest V3 packaging
+- Tailwind CSS v4 for styling
+- Zustand for state
+- Web Crypto API (AES-GCM, PBKDF2) for the vault
+- Ollama for all model inference (local-only)
+- DuckDuckGo HTML endpoint as the default search provider
+
+### Why this is a real differentiator
+Most local AI extensions do one thing:
+- ChatGPT-for-browser extensions: cloud-only, data leaves device
+- Local-only Ollama wrappers: private but isolated, no internet, no memory
+- Browser-native AI (Brave Leo, etc.): fixed model, no user control
+
+Brave Helper combines: local-first by default, mode-isolated, vault-encrypted, multi-model (auto-routed), vision-capable, memory-augmented (RAG), and fully audited. Each capability is gated by an explicit user-visible state. The defaults are private. The user opts into power.
 
 ---
 
@@ -321,6 +388,104 @@ Clearing purges the `messages` array in Zustand, stopping the context from growi
 
 **100. How would you scale this to support cloud LLMs (like OpenAI)?**
 By adding a configuration menu to swap the `baseUrl` from `localhost:11434` to `api.openai.com`, adding an API Key input field to the Vault, and mapping the payload to OpenAI's schema.
+
+---
+
+## Part 6: V3.0 — Modes, Vision, RAG, Audit (Questions 101-120)
+
+**101. What's the architectural commitment summarized in one line?**
+The model READS, never WRITES — all outbound public-internet HTTP is GET-only, enforced by a single chokepoint (`lib/http.ts::safeFetch`).
+
+**102. Why is privacy "architectural" instead of "policy"?**
+Because there's no `POST` code path in the extension that ships user data outbound. Even if the model misbehaved, no exfiltration tool exists in its toolset. Compare that to a policy claim ("we promise we don't…") — code-level guarantees survive bugs and intent changes.
+
+**103. What are the two modes in V3.0 and why mutually exclusive?**
+Research (vault locked, web on) and Autofill (vault unlocked, web off). The harm path is "credentials are reachable + network is reachable → exfiltration possible," so we enforce that those two states never overlap.
+
+**104. Where is the mode actually stored?**
+Nowhere directly. It's derived from `vaultData !== null` via `deriveMode()`. Keeping it derived (single source of truth) means accidental drift between vault state and "what the UI thinks the mode is" is impossible.
+
+**105. What does `capabilitiesFor(mode)` return?**
+A capability map: `{ pageReading, vaultAccess, webSearch, urlFetch, screenshots, memoryRecall }`. Consumers query the relevant flag at the call site (e.g. `/search` checks `caps.webSearch` and refuses if false).
+
+**106. How is the vision model wired?**
+`/ask <prompt>` captures the visible tab via `chrome.tabs.captureVisibleTab`, strips the `data:image/png;base64,` prefix, and POSTs to Ollama's `/api/generate` with `images: [base64]` against `llava:7b`. Streams response chunks the same way as `/api/chat`.
+
+**107. Why use Ollama's `/api/generate` for vision instead of `/api/chat`?**
+LLaVA is single-turn vision; `/api/generate` is the simpler endpoint for "image + prompt → text" without conversation memory. `/api/chat` would also work but adds turn-management overhead we don't need for screenshot Q&A.
+
+**108. What's the embedding model and why that one?**
+`nomic-embed-text` — 274 MB, runs via Ollama's `/api/embeddings` endpoint, produces 768-dim vectors, fast on CPU. Small enough to leave loaded without competing for VRAM with the chat tier.
+
+**109. How is the vector store implemented?**
+Simple linear cosine search over `chrome.storage.local`, capped at 500 records. That's fine for hundreds of saved pages — when the user has thousands, we'd switch to IndexedDB + an ANN index (HNSW). For now, simple wins.
+
+**110. Why doesn't the vault get indexed into the embeddings?**
+The vault contains credentials. Even though embeddings are local, generating an embedding turns a credential into a vector that lives forever in cosine-search-able form. Cleaner rule: vault data never leaves the encrypted store.
+
+**111. What gets logged in the audit panel?**
+Mode transitions, vault unlock/lock, outbound web requests (URL + query summary), page reads, screenshots, autofill executions, model switches, memory recalls, and auto-route decisions. Each entry has a timestamp, the mode at the time, a human-readable summary, and optional structured details.
+
+**112. Why is the audit log append-only?**
+Tamper resistance and trust. If the user could edit entries, the log would be useless as a privacy receipt. Entries are only purged en masse after the retention window (default 30 days) via `pruneAudit()` on init.
+
+**113. What's the retention story for the audit log?**
+2000-entry cap (FIFO when full) + 30-day default retention. Pruning runs on extension init. The user can also clear the entire log from the AUDIT tab — that action itself is logged so "who cleared the log when" is recoverable from the next entry's timestamp.
+
+**114. How does `/search` defend against credential leak?**
+Two layers: (a) at runtime, the slash command checks `capabilitiesFor(mode).webSearch` and refuses when the vault is unlocked; (b) at architecture, `safeFetch` is GET-only — the search query goes in the URL (same as the user typing it into ddg.com), the request body is empty.
+
+**115. What's the response-size cap and why?**
+200 KB default in `safeFetch`. Streams the body and stops reading once the cap is hit. Prevents a malicious search response from filling memory or eating the model's context budget.
+
+**116. Why DuckDuckGo over Google or Bing?**
+DDG's HTML endpoint requires no API key, has no tracking cookies, and is parseable with a small regex. Brave Search is a planned alternative (better quality, requires API key); DDG is the safe default.
+
+**117. Why parse DDG with regex instead of `DOMParser`?**
+We don't trust third-party HTML to not contain hostile script tags or unbounded structure. A regex extracts just the title/url/snippet fields and never instantiates DOM nodes from remote content.
+
+**118. What are `MemoryFact`s and how do they differ from RAG?**
+Memory facts are short, user-curated strings about the user (e.g., "name: Rudransh") injected into every system prompt. RAG (in `vectorstore.ts`) is large embedded text bodies retrieved on demand for `/recall`. Different scopes: facts are persistent identity, RAG is searchable content.
+
+**119. Why default chat to concise and require `/describe` for long answers?**
+Cognitive load + speed. A research assistant that drowns you in essays isn't helpful. Default to the answer the user asked for; promote depth to an explicit opt-in. Costs nothing if you don't use it.
+
+**120. How does the cold-start unload work and why?**
+On extension init, `unloadAllModels(PROJECT_MODELS.map(m => m.name))` fires `keep_alive: 0` to every configured tier model in parallel. Awaited (not fire-and-forget) so the eviction completes before any later step could re-warm Ollama. Result: opening the side panel doesn't load any model into VRAM until the user actually sends a message.
+
+---
+
+## Part 7: V4.0 — Auto-Router (Questions 121-130)
+
+**121. What problem does the V4.0 auto-router solve?**
+The user shouldn't have to think about which model tier to pick. A short greeting doesn't need the 20B Smart model; a code question shouldn't go to the general 9B. The router picks per-message.
+
+**122. How does the router actually work?**
+Before sending the real request, we POST the user's message to the Fast model (`qwen3.5:9b`) with a JSON-only classification system prompt. The model returns `{"tier":"code"}` (or fast/balanced/smart/vision). The system loads the chosen specialist and runs the actual inference.
+
+**123. What configuration makes the router fast and deterministic?**
+`temperature=0.0` (same input → same output), `num_ctx=2048` (tiny context, classification is short), `num_predict=32` (we only need ~10 tokens for the JSON), `stream=false` (atomic response). Total overhead ~50–150 tokens, ~0.3 s on a 16 GB card.
+
+**124. What if the router fails (timeout, parse error, model not loaded)?**
+Silent fallback to `'balanced'` — the safest middle ground. We never block the user on classification failure. A defensive 8-second `AbortController` timeout prevents indefinite hangs.
+
+**125. How does the parser handle messy router output?**
+`parseRouterResponse` tries four strategies in order: direct `JSON.parse`, markdown-code-fence extraction, inline `{"tier":"..."}` regex anywhere in the response, and last-resort bare tier-name match. Lenient by design — small models occasionally wrap their output in prose despite a strict prompt.
+
+**126. Why are slash commands fast-pathed past the router?**
+Slash commands have explicit semantics — `/code` already names the tier. Re-classifying would be wasted compute. Same for image attachments: those always go to vision, no classification needed.
+
+**127. What's the cost-benefit of running a router on every message?**
+Cost: ~0.3 s + 50 tokens. Benefit: never running a 13 GB model on a one-line greeting, never running a 6.6 GB model on a 5-step code refactor. Net win on both latency and quality once the user's message volume crosses ~10 messages.
+
+**128. Why is the router model the *smallest* one, not a dedicated classifier?**
+We didn't want to ship a separate 100 MB classifier. The Fast 9B is already pulled and loaded for chat. Reusing it for classification means one fewer artifact to maintain, one fewer download for the user, and the model's general intelligence handles edge cases (e.g., "fix this React bug") that a keyword classifier would miss.
+
+**129. How does the router decide between Fast and Smart?**
+The router prompt gives explicit decision rules: short conversational messages → fast, multi-step reasoning / writeups → smart. Code keywords (`function`, `error`, language names, framework names, file extensions) → code. Anything visual ("this image", "screenshot") → vision. Default is balanced when uncertain.
+
+**130. Could you replace the auto-router with a real intent classifier model in the future?**
+Yes — `lib/router.ts` is a single function (`classifyIntent`) that returns a `ModelTier`. Swap the implementation to call a fine-tuned BERT classifier or a small dedicated routing model. The rest of the codebase doesn't change. That's the upgrade path if classification accuracy ever becomes a bottleneck.
 
 ---
 
