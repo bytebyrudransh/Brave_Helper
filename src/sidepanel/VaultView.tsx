@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { useAppStore } from '../store';
 import { 
   isVaultSetup, 
@@ -8,7 +8,7 @@ import {
   type VaultProfile, 
   type VaultLogin 
 } from '../lib/vault';
-import { Lock, Unlock, Plus, KeyRound, User, Trash2, Edit2, ShieldAlert } from 'lucide-react';
+import { Lock, Unlock, Plus, KeyRound, User, Trash2, Edit2, ShieldAlert, Upload, Search, X } from 'lucide-react';
 
 export function VaultView() {
   const { vaultData, vaultPassword, setVaultData } = useAppStore();
@@ -20,9 +20,16 @@ export function VaultView() {
   const [confirmPwd, setConfirmPwd] = useState('');
   const [error, setError] = useState<string | null>(null);
   
-  const [viewMode, setViewMode] = useState<'list' | 'editProfile' | 'editLogin'>('list');
+  const [viewMode, setViewMode] = useState<'list' | 'editProfile' | 'editLogin' | 'csvPreview'>('list');
   const [editingProfile, setEditingProfile] = useState<Partial<VaultProfile>>({});
   const [editingLogin, setEditingLogin] = useState<Partial<VaultLogin>>({});
+
+  // CSV import state
+  const [csvLogins, setCsvLogins] = useState<VaultLogin[]>([]);
+  const csvInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Search state
+  const [searchQuery, setSearchQuery] = useState('');
 
   useEffect(() => {
     void checkSetup();
@@ -146,6 +153,129 @@ export function VaultView() {
     setVaultData(newData, vaultPassword);
   }
 
+  // ── CSV Import Logic ──
+
+  function parseCSV(text: string): VaultLogin[] {
+    const lines = text.split('\n').filter(l => l.trim());
+    if (lines.length < 2) return []; // Need at least header + 1 row
+
+    const header = parseCSVLine(lines[0]).map(h => h.toLowerCase().trim());
+
+    // Detect common column names from different password managers
+    const urlIdx = header.findIndex(h => ['url', 'website', 'login_uri', 'web site'].includes(h));
+    const userIdx = header.findIndex(h => ['username', 'user', 'login_username', 'login', 'email'].includes(h));
+    const passIdx = header.findIndex(h => ['password', 'pass', 'login_password'].includes(h));
+    const nameIdx = header.findIndex(h => ['name', 'title', 'login_name', 'origin', 'notes'].includes(h));
+
+    if (urlIdx === -1 && userIdx === -1) return []; // Can't identify columns
+
+    const results: VaultLogin[] = [];
+    for (let i = 1; i < lines.length; i++) {
+      const cols = parseCSVLine(lines[i]);
+      if (cols.length === 0) continue;
+
+      const url = urlIdx >= 0 ? cols[urlIdx]?.trim() || '' : '';
+      const username = userIdx >= 0 ? cols[userIdx]?.trim() || '' : '';
+      const password = passIdx >= 0 ? cols[passIdx]?.trim() || '' : '';
+      const notes = nameIdx >= 0 ? cols[nameIdx]?.trim() || '' : '';
+
+      if (!url && !username) continue; // Skip empty rows
+
+      results.push({
+        id: crypto.randomUUID(),
+        url,
+        username,
+        password,
+        notes,
+      });
+    }
+    return results;
+  }
+
+  /** Parse a single CSV line, respecting quoted fields with commas inside */
+  function parseCSVLine(line: string): string[] {
+    const result: string[] = [];
+    let current = '';
+    let inQuotes = false;
+
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (inQuotes && line[i + 1] === '"') {
+          current += '"';
+          i++; // skip escaped quote
+        } else {
+          inQuotes = !inQuotes;
+        }
+      } else if (ch === ',' && !inQuotes) {
+        result.push(current);
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    result.push(current);
+    return result;
+  }
+
+  function handleCSVFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = reader.result as string;
+      const parsed = parseCSV(text);
+      if (parsed.length === 0) {
+        setError('Could not parse CSV. Make sure it has columns like: url, username, password');
+        return;
+      }
+      setCsvLogins(parsed);
+      setViewMode('csvPreview');
+      setError(null);
+    };
+    reader.readAsText(file);
+  }
+
+  async function handleCSVImport() {
+    if (!vaultData || !vaultPassword || csvLogins.length === 0) return;
+    
+    setLoading(true);
+    try {
+      const newData: VaultData = {
+        ...vaultData,
+        logins: [...vaultData.logins, ...csvLogins],
+      };
+      await saveVault(vaultPassword, newData);
+      setVaultData(newData, vaultPassword);
+      setCsvLogins([]);
+      setViewMode('list');
+    } catch (err) {
+      setError('Failed to import CSV entries');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ── Filtered lists ──
+
+  const filteredLogins = vaultData?.logins.filter(l => {
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    return (
+      l.url.toLowerCase().includes(q) ||
+      l.username.toLowerCase().includes(q) ||
+      (l.notes?.toLowerCase().includes(q) ?? false)
+    );
+  }) ?? [];
+
+  const filteredProfiles = vaultData?.profiles.filter(p => {
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    return (
+      p.title.toLowerCase().includes(q) ||
+      p.fullName.toLowerCase().includes(q) ||
+      p.email.toLowerCase().includes(q)
+    );
+  }) ?? [];
+
   if (loading && !vaultData) {
     return <div className="p-4 text-xs text-text-muted">Loading vault...</div>;
   }
@@ -247,21 +377,113 @@ export function VaultView() {
     );
   }
 
+  // ── CSV Preview View ──
+  if (viewMode === 'csvPreview') {
+    return (
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="text-xs font-bold uppercase text-text-muted flex items-center gap-1.5">
+            <Upload className="h-3.5 w-3.5" /> CSV Preview
+          </h3>
+          <button onClick={() => { setCsvLogins([]); setViewMode('list'); }} className="text-text-muted hover:text-white p-1">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="rounded-lg border border-accent/30 bg-accent/5 p-3">
+          <p className="text-xs font-bold text-accent">Found {csvLogins.length} entries</p>
+          <p className="text-[10px] text-text-muted mt-1">Review below, then click Import to encrypt and save all entries to your vault.</p>
+        </div>
+
+        {error && <p className="text-[10px] text-danger text-center">{error}</p>}
+
+        <div className="grid gap-2 max-h-[300px] overflow-y-auto">
+          {csvLogins.slice(0, 50).map((l, i) => (
+            <div key={l.id} className="flex items-center justify-between rounded-lg border border-border bg-surface p-2">
+              <div className="min-w-0">
+                <p className="text-[11px] font-bold text-white truncate">{l.url || '(no url)'}</p>
+                <p className="text-[10px] text-text-muted truncate">{l.username}</p>
+              </div>
+              <span className="text-[9px] text-text-muted shrink-0 ml-2">#{i + 1}</span>
+            </div>
+          ))}
+          {csvLogins.length > 50 && (
+            <p className="text-[10px] text-text-muted text-center italic">...and {csvLogins.length - 50} more</p>
+          )}
+        </div>
+
+        <div className="flex gap-2 pt-2">
+          <button onClick={() => { setCsvLogins([]); setViewMode('list'); }} className="flex-1 rounded border border-border py-1.5 text-xs text-text-muted hover:text-white">Cancel</button>
+          <button
+            onClick={() => void handleCSVImport()}
+            disabled={loading}
+            className="flex-1 rounded bg-accent py-1.5 text-xs font-bold text-white hover:bg-accent/90 disabled:opacity-50"
+          >
+            {loading ? 'Importing...' : `Import ${csvLogins.length} Entries`}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // ── Main Unlocked View ──
   return (
-    <div className="flex-1 overflow-y-auto p-4 space-y-6">
+    <div className="flex-1 overflow-y-auto p-4 space-y-4">
       <div className="flex items-center justify-between border-b border-border/50 pb-2">
         <div className="flex items-center gap-2 text-success">
           <Unlock className="h-4 w-4" />
           <span className="text-xs font-bold">Vault Unlocked</span>
         </div>
-        <button 
-          onClick={() => setVaultData(null, null)}
-          className="text-[10px] uppercase font-bold text-text-muted hover:text-white px-2 py-1 rounded bg-surface border border-border"
-        >
-          Lock
-        </button>
+        <div className="flex items-center gap-2">
+          <input
+            ref={csvInputRef}
+            type="file"
+            accept=".csv"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleCSVFile(file);
+              e.target.value = '';
+            }}
+          />
+          <button
+            onClick={() => csvInputRef.current?.click()}
+            className="flex items-center gap-1 text-[10px] uppercase font-bold text-text-muted hover:text-accent px-2 py-1 rounded bg-surface border border-border transition-all hover:border-accent"
+            title="Import passwords from CSV file"
+          >
+            <Upload className="h-3 w-3" />
+            CSV
+          </button>
+          <button 
+            onClick={() => setVaultData(null, null)}
+            className="text-[10px] uppercase font-bold text-text-muted hover:text-white px-2 py-1 rounded bg-surface border border-border"
+          >
+            Lock
+          </button>
+        </div>
       </div>
+
+      {/* Search Bar */}
+      <div className="relative">
+        <Search className="absolute left-2.5 top-1/2 h-3 w-3 -translate-y-1/2 text-text-muted" />
+        <input
+          type="text"
+          placeholder="Search vault..."
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          className="w-full rounded-lg border border-border bg-surface pl-8 pr-8 py-2 text-xs text-white outline-none focus:border-accent placeholder:text-text-muted"
+        />
+        {searchQuery && (
+          <button
+            onClick={() => setSearchQuery('')}
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-text-muted hover:text-white"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        )}
+      </div>
+
+      {error && <p className="text-[10px] text-danger text-center">{error}</p>}
 
       {/* Profiles */}
       <div className="space-y-3">
@@ -277,11 +499,13 @@ export function VaultView() {
           </button>
         </div>
         
-        {vaultData.profiles.length === 0 ? (
-          <p className="text-[11px] text-text-muted italic px-2">No profiles saved.</p>
+        {filteredProfiles.length === 0 ? (
+          <p className="text-[11px] text-text-muted italic px-2">
+            {searchQuery ? 'No profiles match your search.' : 'No profiles saved.'}
+          </p>
         ) : (
           <div className="grid gap-2">
-            {vaultData.profiles.map(p => (
+            {filteredProfiles.map(p => (
               <div key={p.id} className="group relative flex items-center justify-between rounded-lg border border-border bg-surface p-3">
                 <div className="min-w-0">
                   <p className="text-[12px] font-bold text-white truncate">{p.title}</p>
@@ -301,7 +525,7 @@ export function VaultView() {
       <div className="space-y-3">
         <div className="flex items-center justify-between">
           <h3 className="text-xs font-bold uppercase text-text-muted flex items-center gap-1.5">
-            <KeyRound className="h-3.5 w-3.5" /> Logins
+            <KeyRound className="h-3.5 w-3.5" /> Logins ({filteredLogins.length})
           </h3>
           <button 
             onClick={() => { setEditingLogin({}); setViewMode('editLogin'); }}
@@ -311,11 +535,13 @@ export function VaultView() {
           </button>
         </div>
         
-        {vaultData.logins.length === 0 ? (
-          <p className="text-[11px] text-text-muted italic px-2">No logins saved.</p>
+        {filteredLogins.length === 0 ? (
+          <p className="text-[11px] text-text-muted italic px-2">
+            {searchQuery ? 'No logins match your search.' : 'No logins saved.'}
+          </p>
         ) : (
           <div className="grid gap-2">
-            {vaultData.logins.map(l => (
+            {filteredLogins.map(l => (
               <div key={l.id} className="group relative flex items-center justify-between rounded-lg border border-border bg-surface p-3">
                 <div className="min-w-0">
                   <p className="text-[12px] font-bold text-white truncate">{l.url}</p>

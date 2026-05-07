@@ -25,12 +25,7 @@ export function FormFillView() {
     setFillState('idle');
     try {
       const extracted = await requestFormExtraction();
-      const visibleForms = extracted.map(form => ({
-        ...form,
-        fields: form.fields.filter(f => f.isVisible)
-      })).filter(form => form.fields.length > 0);
-      
-      setForms(visibleForms);
+      setForms(extracted.filter(f => f.fields.length > 0));
     } catch (err) {
       let errMsg = err instanceof Error ? err.message : String(err);
       if (errMsg.includes('Receiving end does not exist')) {

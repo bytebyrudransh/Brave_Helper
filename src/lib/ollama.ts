@@ -27,6 +27,26 @@ export async function listOllamaModels(): Promise<OllamaModel[]> {
   return data.models ?? [];
 }
 
+/** Lists models currently loaded in memory by Ollama. */
+export async function listLoadedOllamaModels(): Promise<OllamaModel[]> {
+  const res = await fetch(`${OLLAMA_URL}/api/ps`);
+  if (!res.ok) throw new Error(`Ollama /api/ps returned ${res.status}`);
+  const data = (await res.json()) as { models?: OllamaModel[] };
+  return data.models ?? [];
+}
+
+/**
+ * Tells Ollama to evict the given model from memory immediately.
+ * `keep_alive: 0` is Ollama's documented unload signal.
+ */
+export async function unloadOllamaModel(name: string): Promise<void> {
+  await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: name, keep_alive: 0 }),
+  });
+}
+
 export async function* streamChat(
   opts: StreamChatOptions
 ): AsyncGenerator<string, void, void> {

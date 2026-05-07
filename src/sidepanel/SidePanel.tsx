@@ -5,26 +5,32 @@ import {
   Globe, 
   AlertCircle, 
   Loader2, 
-  Cpu, 
+  Cpu,
   ChevronDown,
   Sparkles,
   Command,
-  Zap,
   ShieldCheck,
   StopCircle,
   History,
   MessageSquare,
-  FileText
+  FileText,
+  Activity,
+  Paperclip,
+  Power,
 } from 'lucide-react';
 import { useAppStore } from '../store';
-import { listOllamaModels, streamChat, type ChatTurn } from '../lib/ollama';
-import { requestActiveTabSnapshot } from '../lib/page';
+import { deriveMode, MODE_DESCRIPTIONS, MODE_LABELS } from '../lib/mode';
+import { listOllamaModels, streamChat, unloadOllamaModel, type ChatTurn } from '../lib/ollama';
+import { streamVision } from '../lib/vision';
+import { searchWeb, formatSearchContext } from '../lib/search';
+import { capabilitiesFor } from '../lib/mode';
+import { indexMemory, recallMemory } from '../lib/vectorstore';
+import { logAudit, pruneAudit } from '../lib/audit';
+import { requestActiveTabSnapshot, requestFormExtraction, requestFormFill } from '../lib/page';
 import { PROJECT_MODEL_MAP, PROJECT_MODELS } from '../config/models';
 import { captureVisibleScreenshot, saveCurrentPage } from '../lib/session';
 import { 
   saveChatSession, 
-  getLastSessionId, 
-  getChatSession, 
   saveLastSessionId,
   saveSelectedModel,
   getSelectedModel
@@ -32,23 +38,77 @@ import {
 import { HistoryView } from './HistoryView';
 import { FormFillView } from './FormFillView';
 import { VaultView } from './VaultView';
+import { AuditView } from './AuditView';
+import { loadMemoryFacts, formatMemoryPrompt, type MemoryFact } from '../lib/memory';
+
+/**
+ * Approx token budget for page text we ship to the model.
+ * 4 chars/token is the rough English heuristic. 6k tokens → 24k chars.
+ * Anything past this is truncated with a "[truncated]" marker so the model
+ * knows it didn't see the whole page.
+ */
+const PAGE_TEXT_CHAR_CAP = 24_000;
+const PAGE_LINKS_CAP = 50;
+
+function truncatePageText(text: string): { text: string; truncated: boolean } {
+  if (text.length <= PAGE_TEXT_CHAR_CAP) return { text, truncated: false };
+  return { text: text.slice(0, PAGE_TEXT_CHAR_CAP), truncated: true };
+}
 
 function buildPageContext(): string | null {
-  const { page, pageScopeEnabled } = useAppStore.getState();
+  const { page, pageScopeEnabled, extractedForms, vaultData } = useAppStore.getState();
   if (!page || !pageScopeEnabled) return null;
-  const linkList = page.links
-    .slice(0, 50)
+
+  const { text: pageText, truncated } = truncatePageText(page.text);
+  const links = page.links.slice(0, PAGE_LINKS_CAP);
+  const linkList = links
     .map((l) => `- ${l.text || '(no text)'} → ${l.href}`)
     .join('\n');
-  return `# Current page
+  const linksTruncated = page.links.length > PAGE_LINKS_CAP;
+
+  let ctx = `# Current page
 Title: ${page.title}
 URL: ${page.url}
 
-## Visible text (truncated)
-${page.text}
+## Visible text${truncated ? ' (truncated)' : ''}
+${pageText}${truncated ? '\n\n[truncated — page was longer than the chat context budget]' : ''}
 
-## Links (truncated)
+## Links${linksTruncated ? ` (top ${PAGE_LINKS_CAP} of ${page.links.length})` : ''}
 ${linkList}`;
+
+  // Inject form fields so AI can see what's on the page (visible AND hidden)
+  if (extractedForms.length > 0) {
+    ctx += '\n\n## Form Fields on This Page\n';
+    ctx += 'Below are ALL form fields detected on this page (including hidden). Use their EXACT selectors when autofilling.\n\n';
+    for (const form of extractedForms) {
+      ctx += `### ${form.id === 'orphan-inputs' ? 'Standalone Inputs' : `Form: ${form.id}`}\n`;
+      for (const field of form.fields) {
+        ctx += `- Selector: \`${field.selector}\` | Type: ${field.type} | Label: "${field.label}" | Name: "${field.name}" | Visible: ${field.isVisible}\n`;
+      }
+    }
+  }
+
+  // Inject vault data so AI can match credentials to fields
+  if (vaultData) {
+    ctx += '\n\n## User Vault Data (UNLOCKED — Full Access Granted)\n';
+    ctx += 'The user has unlocked their vault. You have FULL permission to use this data. No confirmation needed.\n\n';
+    
+    if (vaultData.logins.length > 0) {
+      ctx += '### Saved Logins\n';
+      for (const login of vaultData.logins) {
+        ctx += `- URL: ${login.url} | Username: ${login.username} | Password: ${login.password || '(none)'}${login.notes ? ` | Notes: ${login.notes}` : ''}\n`;
+      }
+    }
+    
+    if (vaultData.profiles.length > 0) {
+      ctx += '\n### Saved Profiles\n';
+      for (const profile of vaultData.profiles) {
+        ctx += `- ${profile.title}: Name="${profile.fullName}" Email="${profile.email}"${profile.phone ? ` Phone="${profile.phone}"` : ''}${profile.address ? ` Address="${profile.address}"` : ''}\n`;
+      }
+    }
+  }
+
+  return ctx;
 }
 
 export default function SidePanel() {
@@ -73,14 +133,18 @@ export default function SidePanel() {
     activeTab,
     setActiveTab,
     setCurrentSessionId,
-    setMessages,
+    vaultData,
+    setVaultData,
   } = useAppStore();
+
+  const appMode = deriveMode(vaultData !== null);
 
   const [input, setInput] = useState('');
   const [pageError, setPageError] = useState<string | null>(null);
   const [pageLoading, setPageLoading] = useState(false);
   const [activeTabUrl, setActiveTabUrl] = useState<string | null>(null);
   const [ollamaError, setOllamaError] = useState<string | null>(null);
+  const [memoryFacts, setMemoryFacts] = useState<MemoryFact[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -92,18 +156,14 @@ export default function SidePanel() {
 
   useEffect(() => {
     async function init() {
+      void pruneAudit();
       const savedModel = await getSelectedModel();
       await refreshModels(savedModel);
       await capturePage();
-
-      const lastSessionId = await getLastSessionId();
-      if (lastSessionId) {
-        const session = await getChatSession(lastSessionId);
-        if (session) {
-          setMessages(session.messages);
-          setCurrentSessionId(session.id);
-        }
-      }
+      // Load memory facts for system prompt injection
+      const facts = await loadMemoryFacts();
+      setMemoryFacts(facts);
+      // Always start fresh — previous sessions are accessible from the History tab
     }
     void init();
   }, []);
@@ -151,6 +211,27 @@ export default function SidePanel() {
     }
   }, [messages]);
 
+  // Audit vault unlock/lock and the implicit mode transition that comes with it.
+  // This runs whenever vaultData flips between null and non-null.
+  const prevVaultRef = useRef<boolean>(vaultData !== null);
+  useEffect(() => {
+    const isUnlocked = vaultData !== null;
+    if (isUnlocked === prevVaultRef.current) return;
+    prevVaultRef.current = isUnlocked;
+    const newMode = isUnlocked ? 'autofill' : 'research';
+    void logAudit({
+      type: isUnlocked ? 'vault_unlock' : 'vault_lock',
+      mode: newMode,
+      summary: isUnlocked ? 'Vault unlocked — entered Autofill mode' : 'Vault locked — back to Research mode',
+    });
+    void logAudit({
+      type: 'mode_transition',
+      mode: newMode,
+      summary: `Mode → ${newMode}`,
+      details: { from: isUnlocked ? 'research' : 'autofill', to: newMode },
+    });
+  }, [vaultData]);
+
   async function refreshModels(preferredModelName?: string | null) {
     try {
       setOllamaError(null);
@@ -189,6 +270,14 @@ export default function SidePanel() {
     try {
       const snap = await requestActiveTabSnapshot();
       setPage(snap);
+      // Auto-extract ALL forms (visible AND hidden) — gives AI full awareness
+      try {
+        const forms = await requestFormExtraction();
+        useAppStore.getState().setExtractedForms(forms.filter(f => f.fields.length > 0));
+      } catch {
+        // Forms extraction is best-effort; don't block page capture
+        useAppStore.getState().setExtractedForms([]);
+      }
     } catch (err) {
       setPage(null);
       let errMsg = err instanceof Error ? err.message : String(err);
@@ -199,6 +288,45 @@ export default function SidePanel() {
     } finally {
       setPageLoading(false);
     }
+  }
+
+  /**
+   * Build the turn list sent to the model.
+   *
+   * Order matters for small models: they pay most attention to the very start
+   * and the very end of the prompt ("lost in the middle"). So we put the page
+   * context RIGHT BEFORE the user's most recent message instead of burying it
+   * after the system prompt — this keeps the page fresh next to the question.
+   */
+  function buildTurnsForRequest(assistantId: string): ChatTurn[] {
+    const basePrompt = selectedModelConfig?.systemPrompt ?? PROJECT_MODELS[0].systemPrompt;
+    const memoryBlock = formatMemoryPrompt(memoryFacts);
+    const systemContent = memoryBlock ? `${basePrompt}\n\n${memoryBlock}` : basePrompt;
+
+    const turns: ChatTurn[] = [
+      {
+        role: 'system',
+        content: systemContent,
+      },
+    ];
+
+    const allMessages = useAppStore.getState().messages.filter(
+      (m) => m.id !== assistantId
+    );
+    const lastIdx = allMessages.length - 1;
+    const last = lastIdx >= 0 ? allMessages[lastIdx] : null;
+    const earlier = lastIdx >= 0 ? allMessages.slice(0, lastIdx) : allMessages;
+
+    for (const m of earlier) {
+      turns.push({ role: m.role, content: m.content });
+    }
+
+    const ctx = buildPageContext();
+    if (ctx) turns.push({ role: 'system', content: ctx });
+
+    if (last) turns.push({ role: last.role, content: last.content });
+
+    return turns;
   }
 
   async function send() {
@@ -217,20 +345,7 @@ export default function SidePanel() {
     const assistantId = crypto.randomUUID();
     appendMessage({ id: assistantId, role: 'assistant', content: '', streaming: true });
 
-    const turns: ChatTurn[] = [
-      {
-        role: 'system',
-        content:
-          selectedModelConfig?.systemPrompt ??
-          PROJECT_MODELS[0].systemPrompt,
-      },
-    ];
-    const ctx = buildPageContext();
-    if (ctx) turns.push({ role: 'system', content: ctx });
-    for (const m of useAppStore.getState().messages) {
-      if (m.id === assistantId) continue;
-      turns.push({ role: m.role, content: m.content });
-    }
+    const turns = buildTurnsForRequest(assistantId);
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -254,6 +369,13 @@ export default function SidePanel() {
       setIsStreaming(false);
       abortRef.current = null;
       
+      // Auto-execute any autofill commands in the AI response
+      const finalMessages = useAppStore.getState().messages;
+      const lastMsg = finalMessages.find(m => m.id === assistantId);
+      if (lastMsg?.content) {
+        await executeAutofillCommands(lastMsg.content);
+      }
+      
       // Save session
       const { messages, page, currentSessionId: sid } = useAppStore.getState();
       const session = await saveChatSession(messages, page, sid ?? undefined);
@@ -266,6 +388,69 @@ export default function SidePanel() {
 
   function stop() {
     abortRef.current?.abort();
+  }
+
+  /** Emergency kill — abort everything, lock vault, clear chat, return to safe state. */
+  function killAll() {
+    // 1. Abort any running inference
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setIsStreaming(false);
+    // 2. Lock vault immediately
+    setVaultData(null, null);
+    // 3. Clear chat
+    clearMessages();
+    // 4. Reset to chat tab
+    setActiveTab('chat');
+    // 5. Clear input
+    setInput('');
+  }
+
+  /** Handle image file upload for vision */
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  async function handleImageUpload(file: File) {
+    if (!selectedModel || !ollamaReachable) return;
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const base64 = reader.result as string;
+
+      // Show user message with filename
+      const userMsg = {
+        id: crypto.randomUUID(),
+        role: 'user' as const,
+        content: `[Uploaded: ${file.name}] Describe this image.`,
+      };
+      appendMessage(userMsg);
+
+      const assistantId = crypto.randomUUID();
+      appendMessage({ id: assistantId, role: 'assistant', content: '', streaming: true });
+
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      setIsStreaming(true);
+
+      try {
+        for await (const chunk of streamVision({
+          prompt: 'Describe this image in detail. What do you see?',
+          image: base64,
+          signal: ctrl.signal,
+        })) {
+          appendToMessage(assistantId, chunk);
+        }
+      } catch (err) {
+        appendToMessage(
+          assistantId,
+          `\n\n[error: ${err instanceof Error ? err.message : String(err)}]`
+        );
+      } finally {
+        finishStreaming(assistantId);
+        setIsStreaming(false);
+        abortRef.current = null;
+      }
+    };
+    reader.readAsDataURL(file);
   }
 
   function appendAssistantNote(content: string) {
@@ -285,20 +470,7 @@ export default function SidePanel() {
     const assistantId = crypto.randomUUID();
     appendMessage({ id: assistantId, role: 'assistant', content: '', streaming: true });
 
-    const turns: ChatTurn[] = [
-      {
-        role: 'system',
-        content:
-          selectedModelConfig?.systemPrompt ??
-          PROJECT_MODELS[0].systemPrompt,
-      },
-    ];
-    const ctx = buildPageContext();
-    if (ctx) turns.push({ role: 'system', content: ctx });
-    for (const m of useAppStore.getState().messages) {
-      if (m.id === assistantId) continue;
-      turns.push({ role: m.role, content: m.content });
-    }
+    const turns = buildTurnsForRequest(assistantId);
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -323,6 +495,13 @@ export default function SidePanel() {
       setIsStreaming(false);
       abortRef.current = null;
       
+      // Auto-execute any autofill commands in the AI response
+      const finalMessages = useAppStore.getState().messages;
+      const lastMsg = finalMessages.find(m => m.id === assistantId);
+      if (lastMsg?.content) {
+        await executeAutofillCommands(lastMsg.content);
+      }
+      
       // Save session
       const { messages, page, currentSessionId: sid } = useAppStore.getState();
       const session = await saveChatSession(messages, page, sid ?? undefined);
@@ -334,15 +513,17 @@ export default function SidePanel() {
   }
 
   async function runCommand(raw: string) {
-    const command = raw.trim().toLowerCase();
+    const trimmed = raw.trim();
+    const spaceIdx = trimmed.indexOf(' ');
+    const head = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).toLowerCase();
+    const arg = spaceIdx === -1 ? '' : trimmed.slice(spaceIdx + 1).trim();
 
-    if (command === '/clear') {
+    if (head === '/clear') {
       clearMessages();
-      appendAssistantNote('Chat cleared.');
       return;
     }
 
-    if (command === '/start') {
+    if (head === '/start') {
       clearMessages();
       await capturePage();
       appendAssistantNote(
@@ -351,14 +532,14 @@ export default function SidePanel() {
       return;
     }
 
-    if (command === '/summary' || command === '/summery') {
+    if (head === '/summary' || head === '/summery') {
       await askWithPreset(
         'Summarize this page in concise bullets. Include the main topic, key points, and anything actionable.'
       );
       return;
     }
 
-    if (command === '/save') {
+    if (head === '/save') {
       const currentPage = useAppStore.getState().page;
       if (!currentPage) {
         appendAssistantNote('No page snapshot is loaded yet. Press Sync first.');
@@ -366,14 +547,40 @@ export default function SidePanel() {
       }
       const saved = await saveCurrentPage(currentPage);
       appendAssistantNote(`Saved current page locally: ${saved.title || saved.url}`);
+      // Index this page into the memory store so `/recall` can find it later.
+      // Fire-and-forget — embedding failures (e.g. Ollama unreachable) are silent.
+      void indexMemory({
+        kind: 'page',
+        title: currentPage.title || currentPage.url,
+        body: `${currentPage.title}\n\n${currentPage.text}`,
+        url: currentPage.url,
+      });
+      void logAudit({
+        type: 'page_read',
+        mode: vaultData ? 'autofill' : 'research',
+        summary: `Saved page: ${currentPage.title || currentPage.url}`,
+        details: { url: currentPage.url, chars: currentPage.text.length },
+      });
       return;
     }
 
-    if (command === '/takess') {
+    if (head === '/takess') {
       try {
         const dataUrl = await captureVisibleScreenshot();
-        await chrome.tabs.create({ url: dataUrl });
-        appendAssistantNote('Screenshot captured and opened in a new tab.');
+        // Download to user's filesystem
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const filename = `screenshot_${timestamp}.png`;
+        await chrome.downloads.download({
+          url: dataUrl,
+          filename,
+          saveAs: false,
+        });
+        appendAssistantNote(`Screenshot saved to Downloads as \`${filename}\``);
+        void logAudit({
+          type: 'screenshot_captured',
+          mode: vaultData ? 'autofill' : 'research',
+          summary: `Screenshot saved: ${filename}`,
+        });
       } catch (err) {
         appendAssistantNote(
           `Screenshot failed: ${err instanceof Error ? err.message : String(err)}`
@@ -382,9 +589,295 @@ export default function SidePanel() {
       return;
     }
 
+    if (head === '/ask') {
+      await runVisionAsk(arg);
+      return;
+    }
+
+    if (head === '/search') {
+      await runWebSearch(arg);
+      return;
+    }
+
+    if (head === '/recall') {
+      await runMemoryRecall(arg);
+      return;
+    }
+
+    if (head === '/fast' || head === '/balanced' || head === '/smart' || head === '/code') {
+      const tier = head.slice(1) as 'fast' | 'balanced' | 'smart' | 'code';
+      const target = PROJECT_MODELS.find((m) => m.tier === tier);
+      if (!target) {
+        appendAssistantNote(`No model configured for tier "${tier}".`);
+        return;
+      }
+      const installed = useAppStore.getState().models;
+      if (!installed.some((m) => m.name === target.name)) {
+        appendAssistantNote(`Model ${target.name} is not installed in Ollama.`);
+        return;
+      }
+      const prev = selectedModel;
+      setSelectedModel(target.name);
+      void saveSelectedModel(target.name);
+      if (prev && prev !== target.name) {
+        void unloadOllamaModel(prev).catch(() => {});
+      }
+      void logAudit({
+        type: 'model_switched',
+        mode: vaultData ? 'autofill' : 'research',
+        summary: `Switched to ${target.label}`,
+        details: { from: prev ?? 'none', to: target.name, tier },
+      });
+      appendAssistantNote(`Switched to ${target.label}.`);
+      return;
+    }
+
     appendAssistantNote(
-      'Unknown command. Try /start, /clear, /summary, /takeSS, or /save.'
+      'Unknown command. Try /start, /clear, /summary, /save, /takeSS, /ask <prompt>, /search <query>, /recall <query>, or /fast | /balanced | /smart | /code.'
     );
+  }
+
+  /**
+   * Memory recall — embed the query, find the top-K most similar saved pages
+   * or chat summaries, and ask the chat model to synthesize an answer using
+   * those snippets as context.
+   */
+  async function runMemoryRecall(query: string) {
+    if (!query) {
+      appendAssistantNote('Usage: /recall <query>');
+      return;
+    }
+    if (!selectedModel) {
+      appendAssistantNote('No model selected.');
+      return;
+    }
+
+    const mode = vaultData ? 'autofill' : 'research';
+    void logAudit({
+      type: 'memory_recall',
+      mode,
+      summary: `Memory recall: "${query.slice(0, 80)}"`,
+      details: { query: query.slice(0, 200) },
+    });
+
+    appendMessage({
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: `/recall ${query}`,
+    });
+
+    const assistantId = crypto.randomUUID();
+    appendMessage({ id: assistantId, role: 'assistant', content: '', streaming: true });
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setIsStreaming(true);
+
+    try {
+      const hits = await recallMemory(query, 5);
+      if (hits.length === 0) {
+        appendToMessage(
+          assistantId,
+          'No relevant memories found. Save pages with `/save` to build up the index.'
+        );
+        return;
+      }
+
+      const memoryContext =
+        '# Local memory recall\n' +
+        `Query: "${query}"\n\n` +
+        hits
+          .map((h, i) => {
+            const head = `${i + 1}. **${h.record.title}** (${h.record.kind}, score ${h.score.toFixed(2)})`;
+            const url = h.record.url ? `\n   ${h.record.url}` : '';
+            const body = `\n   ${h.record.body.slice(0, 600).replace(/\s+/g, ' ')}`;
+            return head + url + body;
+          })
+          .join('\n\n');
+
+      const turns: ChatTurn[] = [
+        {
+          role: 'system',
+          content: selectedModelConfig?.systemPrompt ?? PROJECT_MODELS[0].systemPrompt,
+        },
+        { role: 'system', content: memoryContext },
+        {
+          role: 'user',
+          content: `Using the recalled memories above, answer: ${query}. Reference items by title.`,
+        },
+      ];
+
+      for await (const chunk of streamChat({
+        model: selectedModel,
+        messages: turns,
+        numCtx: selectedModelConfig?.numCtx,
+        signal: ctrl.signal,
+      })) {
+        appendToMessage(assistantId, chunk);
+      }
+    } catch (err) {
+      appendToMessage(
+        assistantId,
+        `\n\n[recall error: ${err instanceof Error ? err.message : String(err)}]`
+      );
+    } finally {
+      finishStreaming(assistantId);
+      setIsStreaming(false);
+      abortRef.current = null;
+    }
+  }
+
+  /**
+   * Capture the visible tab and ask the local vision model about it.
+   * If no prompt is given, defaults to a generic "describe what you see."
+   */
+  async function runVisionAsk(prompt: string) {
+    const userPrompt = prompt || 'Describe what you see in this screenshot. Be specific.';
+
+    appendMessage({
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: `[Screenshot] ${userPrompt}`,
+    });
+
+    const assistantId = crypto.randomUUID();
+    appendMessage({ id: assistantId, role: 'assistant', content: '', streaming: true });
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setIsStreaming(true);
+
+    try {
+      const dataUrl = await captureVisibleScreenshot();
+      for await (const chunk of streamVision({
+        prompt: userPrompt,
+        image: dataUrl,
+        signal: ctrl.signal,
+      })) {
+        appendToMessage(assistantId, chunk);
+      }
+    } catch (err) {
+      appendToMessage(
+        assistantId,
+        `\n\n[vision error: ${err instanceof Error ? err.message : String(err)}]`
+      );
+    } finally {
+      finishStreaming(assistantId);
+      setIsStreaming(false);
+      abortRef.current = null;
+    }
+  }
+
+  /**
+   * Run a DuckDuckGo web search and feed the results to the chat model
+   * for synthesis. Refuses if the user is in Autofill mode (vault unlocked)
+   * — web access is cut while credentials are reachable.
+   */
+  async function runWebSearch(query: string) {
+    if (!query) {
+      appendAssistantNote('Usage: /search <query>');
+      return;
+    }
+
+    const { vaultData } = useAppStore.getState();
+    const caps = capabilitiesFor(vaultData ? 'autofill' : 'research');
+    if (!caps.webSearch) {
+      appendAssistantNote(
+        'Web search is disabled while the vault is unlocked. Lock the vault to use /search.'
+      );
+      return;
+    }
+
+    if (!selectedModel) {
+      appendAssistantNote('No model selected.');
+      return;
+    }
+
+    appendMessage({
+      id: crypto.randomUUID(),
+      role: 'user',
+      content: `/search ${query}`,
+    });
+
+    const assistantId = crypto.randomUUID();
+    appendMessage({ id: assistantId, role: 'assistant', content: '', streaming: true });
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setIsStreaming(true);
+
+    try {
+      const results = await searchWeb(query);
+      void logAudit({
+        type: 'outbound_request',
+        mode: 'research',
+        summary: `Web search: "${query.slice(0, 80)}"`,
+        details: {
+          provider: 'duckduckgo',
+          query: query.slice(0, 200),
+          results: results.length,
+        },
+      });
+      const searchContext = formatSearchContext(query, results);
+
+      const turns: ChatTurn[] = [
+        {
+          role: 'system',
+          content:
+            selectedModelConfig?.systemPrompt ?? PROJECT_MODELS[0].systemPrompt,
+        },
+        { role: 'system', content: searchContext },
+        {
+          role: 'user',
+          content: `Summarize the search results for: ${query}. Cite the source URLs you use.`,
+        },
+      ];
+
+      for await (const chunk of streamChat({
+        model: selectedModel,
+        messages: turns,
+        numCtx: selectedModelConfig?.numCtx,
+        signal: ctrl.signal,
+      })) {
+        appendToMessage(assistantId, chunk);
+      }
+    } catch (err) {
+      appendToMessage(
+        assistantId,
+        `\n\n[search error: ${err instanceof Error ? err.message : String(err)}]`
+      );
+    } finally {
+      finishStreaming(assistantId);
+      setIsStreaming(false);
+      abortRef.current = null;
+    }
+  }
+
+  /** Parse AI response for ```autofill blocks and execute them immediately */
+  async function executeAutofillCommands(content: string) {
+    const autofillRegex = /```autofill\s*\n([\s\S]*?)\n```/g;
+    let match: RegExpExecArray | null;
+    
+    while ((match = autofillRegex.exec(content)) !== null) {
+      try {
+        const payload = JSON.parse(match[1].trim()) as Record<string, string>;
+        const fieldCount = Object.keys(payload).length;
+        if (fieldCount > 0) {
+          await requestFormFill(payload);
+          appendAssistantNote(`✅ Autofilled ${fieldCount} field${fieldCount > 1 ? 's' : ''} on the page.`);
+          void logAudit({
+            type: 'autofill_executed',
+            mode: vaultData ? 'autofill' : 'research',
+            summary: `Filled ${fieldCount} field${fieldCount > 1 ? 's' : ''}`,
+            details: { fieldCount, vaultUnlocked: vaultData !== null },
+          });
+        }
+      } catch (err) {
+        appendAssistantNote(
+          `⚠️ Autofill execution failed: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }
   }
 
   return (
@@ -393,14 +886,30 @@ export default function SidePanel() {
       <header className="relative z-10 flex flex-col gap-2 border-b border-border/50 bg-bg/80 p-4 backdrop-blur-md">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg accent-gradient text-white shadow-lg shadow-accent/20">
-              <Sparkles className="h-4 w-4" />
+            <div className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-lg bg-surface shadow-lg shadow-accent/20 ring-1 ring-accent/30">
+              <img
+                src={chrome.runtime.getURL('assets/icons/icon-128.png')}
+                alt="Brave Helper"
+                className="h-full w-full object-cover"
+              />
             </div>
             <div>
               <h1 className="text-sm font-bold tracking-tight text-white">BRAVE HELPER</h1>
-              <div className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wider text-text-muted">
-                <span className={`h-1.5 w-1.5 rounded-full ${ollamaReachable ? 'bg-success animate-pulse' : 'bg-danger'}`} />
-                {ollamaReachable ? 'Local AI Active' : 'AI Offline'}
+              <div className="flex items-center gap-2 text-[10px] font-medium uppercase tracking-wider text-text-muted">
+                <div className="flex items-center gap-1.5">
+                  <span className={`h-1.5 w-1.5 rounded-full ${ollamaReachable ? 'bg-success animate-pulse' : 'bg-danger'}`} />
+                  {ollamaReachable ? 'Local AI Active' : 'AI Offline'}
+                </div>
+                <span
+                  title={MODE_DESCRIPTIONS[appMode]}
+                  className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold tracking-tight ${
+                    appMode === 'research'
+                      ? 'bg-success/15 text-success ring-1 ring-success/30'
+                      : 'bg-danger/15 text-danger ring-1 ring-danger/30'
+                  }`}
+                >
+                  {MODE_LABELS[appMode]}
+                </span>
               </div>
             </div>
           </div>
@@ -410,8 +919,15 @@ export default function SidePanel() {
               <select
                 value={selectedModel ?? ''}
                 onChange={(e) => {
-                  setSelectedModel(e.target.value);
-                  void saveSelectedModel(e.target.value);
+                  const next = e.target.value;
+                  const prev = selectedModel;
+                  setSelectedModel(next);
+                  void saveSelectedModel(next);
+                  // Free VRAM/RAM held by the previously selected model.
+                  // Fire-and-forget; failures are non-fatal.
+                  if (prev && prev !== next) {
+                    void unloadOllamaModel(prev).catch(() => {});
+                  }
                 }}
                 className="h-8 appearance-none rounded-lg border border-border bg-surface pl-8 pr-8 text-[11px] font-semibold text-text-secondary outline-none transition-all hover:border-accent hover:text-white"
               >
@@ -432,6 +948,13 @@ export default function SidePanel() {
               title="Refresh Models"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${isStreaming ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              onClick={killAll}
+              className="flex h-6 w-6 items-center justify-center rounded-full bg-danger/20 text-danger transition-all hover:bg-danger/40 hover:scale-110 active:scale-95 ring-1 ring-danger/30"
+              title="Kill All — Stop inference, lock vault, clear chat"
+            >
+              <Power className="h-3 w-3" />
             </button>
           </div>
         </div>
@@ -537,6 +1060,17 @@ export default function SidePanel() {
           <FileText className="h-3.5 w-3.5" />
           FORMS
         </button>
+        <button
+          onClick={() => setActiveTab('audit')}
+          className={`flex items-center gap-1.5 border-b-2 px-3 py-2 text-xs font-bold transition-all ${
+            activeTab === 'audit'
+              ? 'border-accent text-white'
+              : 'border-transparent text-text-muted hover:text-text-secondary'
+          }`}
+        >
+          <Activity className="h-3.5 w-3.5" />
+          AUDIT
+        </button>
       </div>
 
       {/* Main Content Area */}
@@ -546,6 +1080,8 @@ export default function SidePanel() {
         <VaultView />
       ) : activeTab === 'form-fill' ? (
         <FormFillView />
+      ) : activeTab === 'audit' ? (
+        <AuditView />
       ) : (
         <>
           <div ref={scrollRef} className="flex-1 space-y-6 overflow-y-auto p-4 py-8">
@@ -571,7 +1107,7 @@ export default function SidePanel() {
               ))}
             </div>
             <div className="flex flex-wrap justify-center gap-2 max-w-xs">
-              {['/start', '/clear', '/summary', '/takeSS', '/save'].map((item) => (
+              {['/start', '/clear', '/summary', '/takeSS', '/save', '/ask', '/search '].map((item) => (
                 <button
                   key={item}
                   onClick={() => setInput(item)}
@@ -592,7 +1128,9 @@ export default function SidePanel() {
                 <div className={`flex items-center gap-2 mb-1.5 px-1 ${m.role === 'user' ? 'flex-row-reverse' : ''}`}>
                    {m.role === 'user' ? <Command className="h-3 w-3 text-text-muted" /> : <Sparkles className="h-3 w-3 text-accent" />}
                    <span className="text-[10px] font-bold uppercase tracking-widest text-text-muted">
-                     {m.role === 'user' ? 'System User' : selectedModel?.toUpperCase() || 'Assistant'}
+                     {m.role === 'user'
+                       ? 'System User'
+                       : (selectedModelConfig?.label.toUpperCase() ?? selectedModel?.toUpperCase() ?? 'Assistant')}
                    </span>
                 </div>
                 <div
@@ -638,30 +1176,32 @@ export default function SidePanel() {
           />
           
           <div className="flex items-center justify-between border-t border-border/50 px-2 py-1.5 mt-1">
-            <div className="flex items-center gap-3 px-1">
-              <div className="flex items-center gap-1 text-[10px] font-bold text-text-muted">
-                <ShieldCheck className="h-3 w-3 text-success" />
-                <span className="uppercase tracking-tight">Secure</span>
-              </div>
-              <div className="flex items-center gap-1 text-[10px] font-bold text-text-muted">
-                <Zap className="h-3 w-3 text-warning" />
-                <span className="uppercase tracking-tight">Offline</span>
-              </div>
-              {selectedModelConfig && (
-                <div className="flex items-center gap-1 text-[10px] font-bold text-text-muted">
-                  <Cpu className="h-3 w-3 text-accent" />
-                  <span className="uppercase tracking-tight">
-                    {Math.round(selectedModelConfig.numCtx / 1000)}K Active
-                  </span>
-                </div>
-              )}
+            <div className="flex items-center gap-1">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) void handleImageUpload(file);
+                  e.target.value = '';
+                }}
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={!ollamaReachable}
+                className="flex h-7 w-7 items-center justify-center rounded-lg text-text-muted transition-all hover:bg-surface hover:text-accent disabled:opacity-30"
+                title="Upload image for vision analysis"
+              >
+                <Paperclip className="h-3.5 w-3.5" />
+              </button>
             </div>
 
             <div className="flex items-center gap-2">
               <button
                 onClick={() => {
                   clearMessages();
-                  appendAssistantNote('Chat cleared.');
                 }}
                 className="rounded-lg border border-border bg-surface px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-text-secondary transition-all hover:border-accent hover:text-white"
                 title="Clear Chat"
@@ -688,10 +1228,6 @@ export default function SidePanel() {
             </div>
           </div>
         </div>
-        
-        <p className="mt-2 text-center text-[9px] font-bold uppercase tracking-[0.2em] text-text-muted/50">
-          Neural Architecture V2.0 — Local Environment
-        </p>
       </div>
         </>
       )}

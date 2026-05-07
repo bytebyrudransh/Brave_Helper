@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { OllamaModel } from '../lib/ollama';
 import { PROJECT_MODELS } from '../config/models';
 import type { VaultData } from '../lib/vault';
+import type { ExtractedForm } from '../lib/page';
 
 export type ChatRole = 'user' | 'assistant';
 
@@ -20,7 +21,7 @@ export interface PageSnapshot {
   capturedAt: number;
 }
 
-export type ViewTab = 'chat' | 'history' | 'form-fill' | 'vault' | 'settings';
+export type ViewTab = 'chat' | 'history' | 'form-fill' | 'vault' | 'audit' | 'settings';
 
 interface AppState {
   models: OllamaModel[];
@@ -37,6 +38,9 @@ interface AppState {
   
   vaultData: VaultData | null;
   vaultPassword: string | null;
+
+  extractedForms: ExtractedForm[];
+  setExtractedForms: (forms: ExtractedForm[]) => void;
 
   setModels: (models: OllamaModel[]) => void;
   setSelectedModel: (name: string) => void;
@@ -71,6 +75,9 @@ export const useAppStore = create<AppState>((set) => ({
   
   vaultData: null,
   vaultPassword: null,
+
+  extractedForms: [],
+  setExtractedForms: (forms) => set({ extractedForms: forms }),
 
   setModels: (models) =>
     set((state) => {

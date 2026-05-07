@@ -38,8 +38,6 @@ export interface PageErrorResponse {
 
 export type PageResponse = PageSnapshotResponse | PageFormResponse | PageErrorResponse;
 
-export const MAX_PAGE_TEXT = 20_000;
-export const MAX_LINKS = 200;
 
 export async function requestActiveTabSnapshot(): Promise<PageSnapshot> {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });

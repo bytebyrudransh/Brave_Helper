@@ -1,6 +1,4 @@
 import {
-  MAX_LINKS,
-  MAX_PAGE_TEXT,
   type PageMessage,
   type PageResponse,
   type ExtractedForm,
@@ -9,16 +7,15 @@ import {
 import type { PageSnapshot } from '../store';
 
 function captureSnapshot(): PageSnapshot {
-  const text = (document.body?.innerText ?? '').slice(0, MAX_PAGE_TEXT);
+  const text = document.body?.innerText ?? '';
   const links: PageSnapshot['links'] = [];
   const seen = new Set<string>();
   for (const a of Array.from(document.querySelectorAll('a[href]'))) {
     const href = (a as HTMLAnchorElement).href;
     if (!href || seen.has(href)) continue;
     seen.add(href);
-    const label = (a.textContent ?? '').trim().replace(/\s+/g, ' ').slice(0, 200);
+    const label = (a.textContent ?? '').trim().replace(/\s+/g, ' ');
     links.push({ href, text: label });
-    if (links.length >= MAX_LINKS) break;
   }
   return {
     url: location.href,
@@ -64,8 +61,8 @@ function extractFieldData(el: Element): ExtractedField {
     labelText = input.getAttribute('placeholder') || input.name || input.id || 'Unknown Field';
   }
   
-  labelText = labelText.replace(/\s+/g, ' ').trim().slice(0, 100);
-  
+  labelText = labelText.replace(/\s+/g, ' ').trim();
+
   const isVisible = !!(input.offsetWidth || input.offsetHeight || input.getClientRects().length);
   
   return {
@@ -84,7 +81,7 @@ function extractForms(): ExtractedForm[] {
   
   formElements.forEach((formEl, idx) => {
     const fields: ExtractedField[] = [];
-    const inputs = formEl.querySelectorAll('input:not([type="hidden"]), select, textarea');
+    const inputs = formEl.querySelectorAll('input, select, textarea');
     inputs.forEach(input => {
       processedInputs.add(input);
       fields.push(extractFieldData(input));
@@ -99,7 +96,7 @@ function extractForms(): ExtractedForm[] {
     }
   });
   
-  const allInputs = document.querySelectorAll('input:not([type="hidden"]), select, textarea');
+  const allInputs = document.querySelectorAll('input, select, textarea');
   const orphanFields: ExtractedField[] = [];
   allInputs.forEach(input => {
     if (!processedInputs.has(input)) {
