@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Local Brave Helper",
+  "name": "Brave Helper",
   "version": "0.4.0",
   "description": "Local-only side-panel AI assistant with intelligent auto-routing. Summarizes, codes, searches, and fills forms via local Ollama.",
   "minimum_chrome_version": "114",
@@ -11,7 +11,7 @@
     "128": "assets/icons/icon-128.png"
   },
   "action": {
-    "default_title": "Open Local Brave Helper",
+    "default_title": "Open Brave Helper",
     "default_icon": {
       "16": "assets/icons/icon-16.png",
       "32": "assets/icons/icon-32.png",

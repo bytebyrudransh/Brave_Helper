@@ -381,7 +381,7 @@ No. Ollama runs entirely offline. The model only knows what it was trained on an
 By accumulating incomplete chunks in a buffer variable and attempting to parse only complete lines (`\n` separated).
 
 **98. What is the "System Prompt" configured in `models.ts`?**
-It dictates the persona and strict behavioral constraints of the AI (e.g., "You are Antigravity... Provide concise answers... Do not hallucinate URLs").
+It dictates the persona and strict behavioral constraints of the AI (e.g., "You are a fast local research assistant in Brave's side panel... default to short, 1–3 sentences... never claim you can't see the page when context contains text").
 
 **99. Why implement a "Clear" button instead of just restarting?**
 Clearing purges the `messages` array in Zustand, stopping the context from growing indefinitely and saving processing time for the LLM on subsequent queries.
