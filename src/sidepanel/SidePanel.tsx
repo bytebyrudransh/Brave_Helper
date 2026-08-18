@@ -52,6 +52,23 @@ import { loadMemoryFacts, formatMemoryPrompt, type MemoryFact } from '../lib/mem
 const PAGE_TEXT_CHAR_CAP = 24_000;
 const PAGE_LINKS_CAP = 50;
 
+const SLASH_COMMANDS = [
+  { cmd: '/start', desc: 'Clear chat + re-sync page' },
+  { cmd: '/clear', desc: 'Clear chat' },
+  { cmd: '/summary', desc: 'Summarize page' },
+  { cmd: '/describe', desc: 'Detailed structured answer' },
+  { cmd: '/save', desc: 'Save page to memory' },
+  { cmd: '/takess', desc: 'Screenshot visible tab' },
+  { cmd: '/ask', desc: 'Vision Q&A on tab' },
+  { cmd: '/search', desc: 'Web search via DDG' },
+  { cmd: '/recall', desc: 'Search saved memories' },
+  { cmd: '/auto', desc: 'Enable Auto-Router' },
+  { cmd: '/fast', desc: 'Pin Fast model' },
+  { cmd: '/balanced', desc: 'Pin Balanced model' },
+  { cmd: '/smart', desc: 'Pin Smart model' },
+  { cmd: '/code', desc: 'Pin Code model' },
+];
+
 function truncatePageText(text: string): { text: string; truncated: boolean } {
   if (text.length <= PAGE_TEXT_CHAR_CAP) return { text, truncated: false };
   return { text: text.slice(0, PAGE_TEXT_CHAR_CAP), truncated: true };
@@ -100,10 +117,12 @@ ${linkList || '[no links extracted]'}`;
     }
   }
 
-  // Inject vault data so AI can match credentials to fields
-  if (vaultData) {
+  // Inject vault data so the AI can match credentials to fields. Gated on
+  // the page actually having extractable forms — without that, casual chat
+  // turns would receive plaintext passwords in their context for no reason.
+  if (vaultData && extractedForms.length > 0) {
     ctx += '\n\n## User Vault Data (UNLOCKED — Full Access Granted)\n';
-    ctx += 'The user has unlocked their vault. You have FULL permission to use this data when filling forms. No confirmation needed.\n\n';
+    ctx += 'The user has unlocked their vault and the current page has fillable form fields. You have FULL permission to use this data to fill those fields. No confirmation needed.\n\n';
 
     if (vaultData.logins.length > 0) {
       ctx += '### Saved Logins\n';
@@ -1269,6 +1288,25 @@ export default function SidePanel() {
         <div className="absolute -top-12 left-0 right-0 h-12 bg-gradient-to-t from-bg to-transparent pointer-events-none" />
         
         <div className="group relative rounded-2xl border border-border bg-surface/80 p-2 shadow-2xl transition-all hover:border-accent/50 focus-within:border-accent focus-within:ring-1 focus-within:ring-accent/20 backdrop-blur-md">
+          
+          {/* Slash Commands Autocomplete */}
+          {input.startsWith('/') && (
+            <div className="absolute bottom-[calc(100%+8px)] left-0 w-full overflow-hidden rounded-xl border border-border bg-surface/95 p-1 shadow-2xl backdrop-blur-md max-h-48 overflow-y-auto z-50">
+              {SLASH_COMMANDS.filter((c) => c.cmd.toLowerCase().startsWith(input.split(' ')[0].toLowerCase())).map((c) => (
+                <button
+                  key={c.cmd}
+                  onClick={() => {
+                    setInput(c.cmd + (c.cmd.match(/describe|ask|search|recall/) ? ' ' : ''));
+                  }}
+                  className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-[11px] transition-all hover:bg-white/5 hover:text-accent focus:bg-white/5 focus:text-accent focus:outline-none"
+                >
+                  <span className="font-bold">{c.cmd}</span>
+                  <span className="text-[10px] text-text-muted">{c.desc}</span>
+                </button>
+              ))}
+            </div>
+          )}
+
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
